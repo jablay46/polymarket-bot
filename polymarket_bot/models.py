@@ -331,6 +331,13 @@ class Leg:
     # Best price available on this side when the signal was built. The gap
     # between this and `price` (the average fill) is the book impact.
     touch_price: Decimal = ZERO
+    # Per-leg market identity. A single-market signal has all legs in one
+    # market, so these can fall back to the group's own values; a cross-market
+    # signal does not, and routing its legs through one group's tick size or
+    # neg-risk flag would place orders the venue rejects.
+    condition_id: str = ""
+    tick_size: Decimal = Decimal("0.01")
+    neg_risk: bool = False
 
     @property
     def book_impact(self) -> Decimal:

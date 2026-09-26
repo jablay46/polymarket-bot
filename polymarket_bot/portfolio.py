@@ -30,6 +30,11 @@ class PositionLeg:
     shares: Decimal
     entry_price: Decimal
     condition_id: str = ""
+    # Per-leg venue settings, carried from the signal. A cross-market position
+    # spans two markets that can disagree on tick size, and an exit has to
+    # respect each leg's own market rather than one position-wide value.
+    tick_size: Decimal = Decimal("0.01")
+    neg_risk: bool = False
 
     @property
     def cost_usd(self) -> Decimal:
@@ -201,6 +206,8 @@ class Portfolio:
                         Decimal(str(f[2])),
                         Decimal(str(f[3])),
                         str(f[4]) if len(f) > 4 else "",
+                        Decimal(str(f[5])) if len(f) > 5 and f[5] is not None else tick_size,
+                        bool(f[6]) if len(f) > 6 else False,
                     )
                     for f in fills
                     if Decimal(str(f[2])) > 0
@@ -402,6 +409,8 @@ class Portfolio:
                             "shares": str(leg.shares),
                             "entry_price": str(leg.entry_price),
                             "condition_id": leg.condition_id,
+                            "tick_size": str(leg.tick_size),
+                            "neg_risk": leg.neg_risk,
                         }
                         for leg in p.legs
                     ],

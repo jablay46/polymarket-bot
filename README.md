@@ -7,7 +7,7 @@ depth, and executes through a broker you can swap between paper and live.
 - **No dependencies for paper mode.** Standard library only.
 - **Arbitrage first.** Two risk-free strategies enabled by default.
 - **Honest numbers.** Fees, slippage, and book depth are modelled per leg.
-- **113 tests**, no network required to run them.
+- **171 tests**, no network required to run them.
 
 ```
 $ python run.py doctor
@@ -71,7 +71,7 @@ separately from locked-in arbitrage profit so the two can never be confused.
 
 Leave it off unless you have your own reason to believe the reversion.
 
-### 4. Cross-market threshold ladders (signal-only, never auto-executed)
+### 4. Cross-market threshold ladders (off by default)
 
 Some questions form a numeric ladder on one subject and window — "Will BTC be
 above $90k by Dec 31?" and "Will BTC be above $100k by Dec 31?". Above the
@@ -86,13 +86,18 @@ protocol. A ladder relation is inferred from the question text, and the text
 cannot distinguish "BTC above $90k, Binance spot" from "BTC above $90k,
 Coinbase spot" — questions that look identical to the parser but are not the
 same claim. When the relation does not actually hold, the "arbitrage" is a
-directional bet wearing an arbitrage label, so every relation needs a human to
-confirm the resolution rules before it is traded.
+directional bet wearing an arbitrage label.
 
-Accordingly this strategy only emits signals. It is not wired into
-`run_cycle`, its signals carry `metadata["unverified_relation"] = True`, and
-its confidence is zero so it cannot outrank the verified strategies. Wiring it
-to execution is a deliberate decision for whoever reviews it.
+The strategy is off by default and gated accordingly:
+
+* **Paper mode** prices any detected ladder, and each signal carries
+  `metadata["unverified_relation"] = True` and `metadata["confirmed_pair"]`.
+  Paper fills are how you find out whether a relation is worth confirming.
+* **Live mode** trades a ladder only when its two condition ids appear in
+  `POLYMARKET_BOT_CROSS_MARKET_CONFIRMED_PAIRS`. That list is empty by
+  default, so live mode trades no ladders at all until a human puts a pair
+  there. Run `python run.py ladders` to list candidates, then open both
+  markets and confirm the resolution rules agree before listing a pair.
 
 Two details that are easy to get wrong, and are load-bearing:
 
@@ -153,6 +158,7 @@ that market is still open. Closing a position frees the market again.
 | --- | --- |
 | `run.py doctor` | Validate config, reach the API, probe fees and credentials. |
 | `run.py scan` | One read-only pass. Prints opportunities, places nothing. |
+| `run.py ladders` | List detected threshold ladders and their pair ids. Read-only. |
 | `run.py run` | Continuous loop. Paper by default. |
 | `run.py config` | Print the effective configuration. |
 
@@ -164,6 +170,7 @@ python run.py run --kill-switch           # decide, but never place an order
 python run.py run --mode live             # requires credentials
 python run.py scan --limit 300 --json     # more markets, machine-readable
 python run.py scan --show-all             # include groups with no signal
+python run.py ladders --limit 300         # search deeper for ladder markets
 ```
 
 Strategies are toggled with `POLYMARKET_BOT_<NAME>_ENABLED`, not a flag.
@@ -235,6 +242,12 @@ These are enforced in code, not by convention:
   every exit is validated against the live book before it is sent.
 - **Fee realism.** Fees come from the venue per market, with an optional
   safety multiplier, and are subtracted before any edge is reported.
+- **Guessed relations stay gated.** Cross-market ladders rest on a relation
+  inferred from question text. Live mode refuses every pair not named in
+  `POLYMARKET_BOT_CROSS_MARKET_CONFIRMED_PAIRS`, and that list starts empty.
+- **Per-leg venue settings.** Each leg of a cross-market position carries its
+  own condition id, tick size, and neg-risk flag, so entry, unwind, and
+  settlement are all sent to the market the leg actually belongs to.
 
 ## Layout
 
@@ -243,7 +256,9 @@ polymarket_bot/
   models.py       order books, market groups, signals, depth walks
   data.py         Gamma + CLOB clients, market discovery
   fees.py         per-market fee model
-  strategies.py   the three strategies
+  strategies.py   set-arb, basket, and fade strategies
+  relations.py    threshold-ladder detection from question text
+  cross_market.py cross-market ladder pricing and live gate
   risk.py         sizing, exposure, rate limits, kill switch
   execution.py    leg ordering and failure unwind
   exits.py        take profit, stop loss, settlement
@@ -251,7 +266,7 @@ polymarket_bot/
   portfolio.py    cash ledger and positions
   engine.py       the scan/decide/execute loop
   cli.py          command line interface
-tests/            156 tests, no network
+tests/            171 tests, no network
 ```
 
 ## Tests

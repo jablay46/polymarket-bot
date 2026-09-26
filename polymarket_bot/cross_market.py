@@ -8,9 +8,12 @@ are enforced mutually exclusive by the protocol). This one prices a
 position from a *relation this code guessed at* — see
 ``polymarket_bot.relations`` for why that guess can be wrong in a way a
 losing bet is not. Signals from here therefore carry
-``metadata["unverified_relation"] = True`` and are never auto-executed by
-:meth:`~polymarket_bot.engine.TradingEngine.run_cycle`; wiring that up is a
-deliberate choice left to whoever reviews and enables it, not a default.
+``metadata["unverified_relation"] = True``. In paper mode the engine will
+price and fill them so an operator can see the relation behave; in live
+mode every pair must be named in
+``POLYMARKET_BOT_CROSS_MARKET_CONFIRMED_PAIRS`` or it is refused before it
+is priced. That list is empty by default, so enabling the strategy alone
+never puts a guessed relation on the real book.
 
 The trade, once a genuine relation is confirmed
 --------------------------------------------------
@@ -48,10 +51,13 @@ from typing import Mapping
 
 from .config import Config
 from .fees import FeeModel
+from .logging_setup import get_logger
 from .models import ONE, ZERO, Leg, OrderBook, Signal, quantize_down
 from .relations import ThresholdCandidate, extract_direction, extract_threshold
 
 MAX_LEVELS = 40
+
+log = get_logger("cross_market")
 
 
 def candidate_from_market(market) -> ThresholdCandidate | None:
@@ -60,6 +66,8 @@ def candidate_from_market(market) -> ThresholdCandidate | None:
     Returns None unless the market is binary (one Yes, one No) and its
     question carries a readable threshold. ``direction`` comes from the
     question wording; see :func:`polymarket_bot.relations.extract_direction`.
+    Venue settings and size filters travel with the candidate so a pair can be
+    checked against each market's own limits.
     """
     if len(market.token_ids) != 2:
         return None
@@ -74,6 +82,13 @@ def candidate_from_market(market) -> ThresholdCandidate | None:
         yes_token_id=market.token_ids[0],
         no_token_id=market.token_ids[1],
         direction=extract_direction(market.question),
+        tick_size=market.tick_size,
+        neg_risk=bool(market.neg_risk),
+        volume_24h=Decimal(str(market.volume_24h or 0)),
+        liquidity=Decimal(str(market.liquidity or 0)),
+        seconds_to_end=market.seconds_to_end,
+        fees_enabled=bool(getattr(market, "fees_enabled", False)),
+        fee_type=getattr(market, "fee_type", None),
     )
 
 
@@ -102,6 +117,18 @@ class CrossMarketArbitrageStrategy:
             # other, so there is no relation to price.
             return None
 
+        if not self._passes_market_filters(lower, higher):
+            return None
+        if self.config.is_live and not self._pair_confirmed(lower, higher):
+            log.warning(
+                "cross-market pair %s/%s not in the confirmed list; skipping in live mode "
+                "(set POLYMARKET_BOT_CROSS_MARKET_CONFIRMED_PAIRS after checking both "
+                "markets' resolution rules)",
+                lower.market_id[:16],
+                higher.market_id[:16],
+            )
+            return None
+
         # "above": above(higher) implies above(lower) -> Yes(lower) + No(higher).
         # "below": below(lower) implies below(higher) -> Yes(higher) + No(lower).
         implied, implying = (
@@ -122,11 +149,11 @@ class CrossMarketArbitrageStrategy:
             spread = book.spread
             if spread is None or spread > max_spread:
                 return None
-            if book.top_ask_size < Decimal(str(self.config.arb_min_top_size)):
+            if book.top_ask_size < Decimal(str(self.config.cross_market_min_top_size)):
                 return None
 
-        max_gross = Decimal(str(self.config.arb_max_edge))
-        min_edge = Decimal(str(self.config.arb_min_edge))
+        max_gross = Decimal(str(self.config.cross_market_max_edge))
+        min_edge = Decimal(str(self.config.cross_market_min_edge))
 
         yes_depth = sum((lvl.size for lvl in yes_book.asks[:MAX_LEVELS]), ZERO)
         no_depth = sum((lvl.size for lvl in no_book.asks[:MAX_LEVELS]), ZERO)
@@ -149,7 +176,7 @@ class CrossMarketArbitrageStrategy:
             fee_per_set = (
                 fee_yes.buy_fee(sets, yes_fill.avg_price) + fee_no.buy_fee(sets, no_fill.avg_price)
             ) / sets
-            return (gross, gross - fee_per_set, cost, usd, yes_fill, no_fill)
+            return (gross, gross - fee_per_set, cost, usd, yes_fill, no_fill, fee_per_set)
 
         def profitable(sets: Decimal) -> bool:
             result = evaluate(sets)
@@ -174,7 +201,7 @@ class CrossMarketArbitrageStrategy:
         result = evaluate(capacity)
         if result is None:
             return None
-        gross, net, cost, usd, yes_fill, no_fill = result
+        gross, net, cost, usd, yes_fill, no_fill, fee_per_set = result
         if net < min_edge:
             return None
 
@@ -182,10 +209,14 @@ class CrossMarketArbitrageStrategy:
             Leg(
                 implied.yes_token_id, f"YES: {implied.question[:40]}", yes_fill.avg_price, capacity,
                 yes_fill.usd, touch_price=yes_book.best_ask,
+                condition_id=implied.condition_id, tick_size=implied.tick_size,
+                neg_risk=implied.neg_risk,
             ),
             Leg(
                 implying.no_token_id, f"NO: {implying.question[:40]}", no_fill.avg_price, capacity,
                 no_fill.usd, touch_price=no_book.best_ask,
+                condition_id=implying.condition_id, tick_size=implying.tick_size,
+                neg_risk=implying.neg_risk,
             ),
         )
         return Signal(
@@ -201,7 +232,9 @@ class CrossMarketArbitrageStrategy:
             max_sets=capacity,
             metadata={
                 "unverified_relation": True,
+                "directional": False,
                 "gross_edge": str(gross),
+                "fee_per_set": str(fee_per_set),
                 "direction": lower.direction,
                 "implied_market_id": implied.market_id,
                 "implying_market_id": implying.market_id,
@@ -209,12 +242,44 @@ class CrossMarketArbitrageStrategy:
                 "higher_market_id": higher.market_id,
                 "lower_threshold": str(lower.threshold),
                 "higher_threshold": str(higher.threshold),
+                "confirmed_pair": self._pair_confirmed(lower, higher),
+                # Execution records one position spanning two markets, so it
+                # needs each leg's condition id rather than one group id.
+                "cross_market": True,
+                "leg_condition_ids": (implied.condition_id, implying.condition_id),
                 "warning": (
                     "relation detected by keyword pattern, not verified against the "
                     "markets' actual resolution rules — confirm by hand before trading"
                 ),
             },
         )
+
+    # ------------------------------------------------------------ live gating
+    def _pair_key(self, lower: ThresholdCandidate, higher: ThresholdCandidate) -> tuple:
+        return tuple(sorted((lower.condition_id, higher.condition_id)))
+
+    def _pair_confirmed(self, lower: ThresholdCandidate, higher: ThresholdCandidate) -> bool:
+        return self._pair_key(lower, higher) in self.config.confirmed_cross_market_pairs
+
+    def _passes_market_filters(
+        self, lower: ThresholdCandidate, higher: ThresholdCandidate
+    ) -> bool:
+        """Both markets must clear the volume, liquidity, and time floors.
+
+        A ladder leg in a dead market cannot be exited, and the two legs are
+        only mutually coverable if both can actually be traded.
+        """
+        min_volume = Decimal(str(self.config.cross_market_min_volume_24h))
+        min_liquidity = Decimal(str(self.config.cross_market_min_liquidity))
+        min_seconds = self.config.cross_market_min_seconds_left
+        for candidate in (lower, higher):
+            if candidate.volume_24h < min_volume:
+                return False
+            if candidate.liquidity < min_liquidity:
+                return False
+            if candidate.seconds_to_end is not None and candidate.seconds_to_end < min_seconds:
+                return False
+        return True
 
     def find_signals(self, markets, scanner, fee_for) -> list[Signal]:
         """Scan markets for candidate ladders and price every adjacent pair.

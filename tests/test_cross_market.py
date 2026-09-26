@@ -9,6 +9,7 @@ is what catches a pair built on the wrong side of the implication.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from decimal import Decimal
 
 from polymarket_bot.config import Config
@@ -29,10 +30,15 @@ FEE_FREE = FeeModel.for_market(fees_enabled=False)
 
 def make_config(**overrides) -> Config:
     defaults = dict(
-        arb_min_edge=0.02,
-        arb_max_edge=0.15,
+        cross_market_min_edge=0.02,
+        cross_market_max_edge=0.15,
         arb_max_spread=0.05,
-        arb_min_top_size=0.0,
+        cross_market_min_top_size=0.0,
+        # Keep the default volume/liquidity floors out of the way so unit
+        # tests can price a pair without staging market statistics.
+        cross_market_min_volume_24h=0.0,
+        cross_market_min_liquidity=0.0,
+        cross_market_min_seconds_left=0,
     )
     defaults.update(overrides)
     return Config(**defaults)
@@ -272,7 +278,7 @@ def test_cross_market_rejects_thin_top_of_book():
         lower.yes_token_id: book(asks=[("0.45", "5")], bids=[("0.44", "500")]),
         higher.no_token_id: book(asks=[("0.45", "500")], bids=[("0.44", "500")]),
     }
-    signal = CrossMarketArbitrageStrategy(make_config(arb_min_top_size=100)).evaluate_pair(
+    signal = CrossMarketArbitrageStrategy(make_config(cross_market_min_top_size=100)).evaluate_pair(
         lower, higher, books, FEE_FREE, FEE_FREE
     )
     assert signal is None
@@ -290,6 +296,26 @@ def test_cross_market_fees_reduce_the_edge():
     net = strategy.evaluate_pair(lower, higher, books, fee_5, fee_5)
     assert gross is not None and net is not None
     assert net.edge_per_set < gross.edge_per_set
+
+
+def test_signal_stamps_its_own_per_set_fee():
+    """Risk sizing must use the fees the pair was priced with. The two legs can
+    sit in markets with different fee types, so the single group fee the engine
+    passes later is not a safe substitute."""
+    lower, higher = above_pair()
+    books = {
+        lower.yes_token_id: book(asks=[("0.40", "500")], bids=[("0.39", "500")]),
+        higher.no_token_id: book(asks=[("0.40", "500")], bids=[("0.39", "500")]),
+    }
+    strategy = CrossMarketArbitrageStrategy(make_config(cross_market_max_edge=0.5))
+    fee = FeeModel.for_market(fees_enabled=True, fee_type="crypto_fees_v2")
+    signal = strategy.evaluate_pair(lower, higher, books, fee, fee)
+    assert signal is not None
+    stamped = Decimal(signal.metadata["fee_per_set"])
+    assert stamped > ZERO
+    # The stamped fee must be the one that produced the reported net edge.
+    gross = Decimal(signal.metadata["gross_edge"])
+    assert gross - stamped == signal.edge_per_set
 
 
 def test_cross_market_needs_two_sided_books():
@@ -317,11 +343,18 @@ def test_cross_market_missing_book_is_refused():
 
 
 class _Market:
-    def __init__(self, market_id, question, token_ids):
+    def __init__(self, market_id, question, token_ids, **kwargs):
         self.market_id = market_id
         self.condition_id = f"0x{market_id}"
         self.question = question
         self.token_ids = token_ids
+        self.tick_size = kwargs.get("tick_size", Decimal("0.01"))
+        self.neg_risk = kwargs.get("neg_risk", False)
+        self.volume_24h = kwargs.get("volume_24h", 50000)
+        self.liquidity = kwargs.get("liquidity", 20000)
+        self.seconds_to_end = kwargs.get("seconds_to_end", 86400)
+        self.fees_enabled = kwargs.get("fees_enabled", False)
+        self.fee_type = kwargs.get("fee_type", None)
 
 
 def test_candidate_from_market_reads_threshold_and_direction():
@@ -334,6 +367,148 @@ def test_candidate_from_market_reads_threshold_and_direction():
     assert candidate.no_token_id == "no"
 
 
+def test_candidate_from_market_carries_venue_settings():
+    """The two legs of a cross-market pair sit in different markets, so tick
+    size and neg-risk have to travel with the candidate."""
+    market = _Market(
+        "m1",
+        "Will Bitcoin be above $90,000 by December 31?",
+        ("yes", "no"),
+        tick_size=Decimal("0.001"),
+        neg_risk=True,
+    )
+    candidate = candidate_from_market(market)
+    assert candidate is not None
+    assert candidate.tick_size == Decimal("0.001")
+    assert candidate.neg_risk is True
+
+
 def test_candidate_from_market_skips_non_binary_and_thresholdless():
     assert candidate_from_market(_Market("m1", "Who wins?", ("a", "b", "c"))) is None
     assert candidate_from_market(_Market("m2", "Will it rain?", ("yes", "no"))) is None
+
+
+# --------------------------------------------------------------- live gating
+
+
+def _violation_books(lower, higher):
+    return {
+        lower.yes_token_id: book(asks=[("0.45", "500")], bids=[("0.44", "500")]),
+        higher.no_token_id: book(asks=[("0.45", "500")], bids=[("0.44", "500")]),
+    }
+
+
+def test_live_mode_refuses_a_pair_that_is_not_confirmed():
+    """The relation is a guess from wording. In live mode an unconfirmed pair
+    must not reach execution, because a wrong guess is a naked directional bet."""
+    lower, higher = above_pair()
+    strategy = CrossMarketArbitrageStrategy(make_config(mode="live"))
+    signal = strategy.evaluate_pair(
+        lower, higher, _violation_books(lower, higher), FEE_FREE, FEE_FREE
+    )
+    assert signal is None
+
+
+def test_paper_mode_prices_an_unconfirmed_pair_but_flags_it():
+    lower, higher = above_pair()
+    signal = CrossMarketArbitrageStrategy(make_config(mode="paper")).evaluate_pair(
+        lower, higher, _violation_books(lower, higher), FEE_FREE, FEE_FREE
+    )
+    assert signal is not None
+    assert signal.metadata["confirmed_pair"] is False
+    assert signal.metadata["unverified_relation"] is True
+
+
+def test_live_mode_accepts_a_confirmed_pair():
+    lower, higher = above_pair()
+    pair_id = f"{lower.condition_id}:{higher.condition_id}"
+    strategy = CrossMarketArbitrageStrategy(
+        make_config(mode="live", cross_market_confirmed_pairs=pair_id)
+    )
+    signal = strategy.evaluate_pair(
+        lower, higher, _violation_books(lower, higher), FEE_FREE, FEE_FREE
+    )
+    assert signal is not None
+    assert signal.metadata["confirmed_pair"] is True
+
+
+def test_confirmed_pairs_accept_either_order_and_separators():
+    """An operator pastes the ids in whatever order a log printed them, so the
+    lookup has to be order-insensitive."""
+    config = make_config(
+        cross_market_confirmed_pairs="0xa:0xb; 0xd:0xc,0xb:0xa"
+    )
+    assert ("0xa", "0xb") in config.confirmed_cross_market_pairs
+    assert ("0xc", "0xd") in config.confirmed_cross_market_pairs
+    assert len(config.confirmed_cross_market_pairs) == 2
+
+
+def test_confirmed_pairs_ignores_malformed_entries():
+    config = make_config(cross_market_confirmed_pairs="0xa,0xb:0xc:0xd,:,0xe:0xf")
+    assert config.confirmed_cross_market_pairs == frozenset({("0xe", "0xf")})
+
+
+def test_live_gating_precedes_pricing_so_a_confirmed_pair_still_needs_an_edge():
+    """Confirmation only unlocks the pair; it does not manufacture an edge."""
+    lower, higher = above_pair()
+    pair_id = f"{lower.condition_id}:{higher.condition_id}"
+    strategy = CrossMarketArbitrageStrategy(
+        make_config(mode="live", cross_market_confirmed_pairs=pair_id)
+    )
+    # Priced fairly: Yes(low) 0.58, No(high) 0.42 -> cost 1.00, no edge.
+    books = {
+        lower.yes_token_id: book(asks=[("0.58", "500")], bids=[("0.57", "500")]),
+        higher.no_token_id: book(asks=[("0.42", "500")], bids=[("0.41", "500")]),
+    }
+    assert strategy.evaluate_pair(lower, higher, books, FEE_FREE, FEE_FREE) is None
+
+
+def test_market_filters_reject_a_ladder_leg_in_a_dead_market():
+    """A leg in a market with no volume cannot be exited, so the pair is
+    refused even though the books price an edge."""
+    lower, higher = above_pair()
+    strategy = CrossMarketArbitrageStrategy(
+        make_config(
+            cross_market_min_volume_24h=25000.0,
+            cross_market_min_liquidity=10000.0,
+        )
+    )
+    dead = _candidate("lo", "Will Bitcoin be above $90,000 by December 31?", "90000")
+    dead = replace(dead, volume_24h=Decimal("100"), liquidity=Decimal("100"))
+    signal = strategy.evaluate_pair(
+        dead, higher, _violation_books(dead, higher), FEE_FREE, FEE_FREE
+    )
+    assert signal is None
+
+
+def test_signal_legs_carry_their_own_market_venue_settings():
+    """Each leg keeps its own market's condition id and tick size, so the
+    execution path does not have to guess which market a leg belongs to."""
+    lower = replace(
+        _candidate("lo", "Will Bitcoin be above $90,000 by December 31?", "90000"),
+        tick_size=Decimal("0.001"),
+        neg_risk=True,
+    )
+    higher = replace(
+        _candidate("hi", "Will Bitcoin be above $100,000 by December 31?", "100000"),
+        tick_size=Decimal("0.01"),
+        neg_risk=False,
+    )
+    signal = CrossMarketArbitrageStrategy(make_config()).evaluate_pair(
+        lower, higher, _violation_books(lower, higher), FEE_FREE, FEE_FREE
+    )
+    assert signal is not None
+    by_token = {leg.token_id: leg for leg in signal.legs}
+    assert by_token[lower.yes_token_id].condition_id == lower.condition_id
+    assert by_token[lower.yes_token_id].tick_size == Decimal("0.001")
+    assert by_token[lower.yes_token_id].neg_risk is True
+    assert by_token[higher.no_token_id].condition_id == higher.condition_id
+    assert by_token[higher.no_token_id].tick_size == Decimal("0.01")
+    assert by_token[higher.no_token_id].neg_risk is False
+    # Execution needs the per-leg condition ids to book one position across
+    # two markets.
+    assert set(signal.metadata["leg_condition_ids"]) == {
+        lower.condition_id,
+        higher.condition_id,
+    }
+    assert signal.metadata["cross_market"] is True

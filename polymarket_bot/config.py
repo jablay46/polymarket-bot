@@ -69,6 +69,26 @@ class Config:
     basket_min_top_size: float = 25.0
     basket_min_seconds_left: int = 3600
 
+    # ---- Cross-market threshold ladders -------------------------------------
+    # Off by default. This is the one strategy whose edge rests on a relation
+    # inferred from question text, so enabling it is a deliberate act.
+    cross_market_enabled: bool = False
+    cross_market_min_edge: float = 0.02
+    cross_market_max_edge: float = 0.15
+    cross_market_min_volume_24h: float = 25000.0
+    cross_market_min_liquidity: float = 10000.0
+    cross_market_min_top_size: float = 100.0
+    cross_market_min_seconds_left: int = 3600
+    # Gamma caps a page at 100 rows. Ladder markets (crypto thresholds) sit
+    # well below the top of the volume ranking, so the scan has to page.
+    cross_market_scan_pages: int = 3
+    # Live trading requires every pair to be named here, as
+    # "LOWER_CONDITION_ID:HIGHER_CONDITION_ID" (either order). The relation is
+    # guessed from wording, and a wrong guess is a directional bet wearing an
+    # arbitrage label, so live orders are gated on a human having confirmed
+    # the resolution rules. Empty means paper-only.
+    cross_market_confirmed_pairs: str = ""
+
     # ---- Fade extreme -------------------------------------------------------
     fade_enabled: bool = False
     fade_price_below: float = 0.05
@@ -164,6 +184,15 @@ class Config:
             basket_min_liquidity=get_float("POLYMARKET_BOT_BASKET_MIN_LIQUIDITY", 10000.0),
             basket_min_top_size=get_float("POLYMARKET_BOT_BASKET_MIN_TOP_SIZE", 25.0),
             basket_min_seconds_left=get_int("POLYMARKET_BOT_BASKET_MIN_SECONDS_LEFT", 3600),
+            cross_market_enabled=get_bool("POLYMARKET_BOT_CROSS_MARKET_ENABLED", False),
+            cross_market_min_edge=get_float("POLYMARKET_BOT_CROSS_MARKET_MIN_EDGE", 0.02),
+            cross_market_max_edge=get_float("POLYMARKET_BOT_CROSS_MARKET_MAX_EDGE", 0.15),
+            cross_market_min_volume_24h=get_float("POLYMARKET_BOT_CROSS_MARKET_MIN_VOLUME24H", 25000.0),
+            cross_market_min_liquidity=get_float("POLYMARKET_BOT_CROSS_MARKET_MIN_LIQUIDITY", 10000.0),
+            cross_market_min_top_size=get_float("POLYMARKET_BOT_CROSS_MARKET_MIN_TOP_SIZE", 100.0),
+            cross_market_min_seconds_left=get_int("POLYMARKET_BOT_CROSS_MARKET_MIN_SECONDS_LEFT", 3600),
+            cross_market_scan_pages=get_int("POLYMARKET_BOT_CROSS_MARKET_SCAN_PAGES", 3),
+            cross_market_confirmed_pairs=get_str("POLYMARKET_BOT_CROSS_MARKET_CONFIRMED_PAIRS", ""),
             fade_enabled=get_bool("POLYMARKET_BOT_FADE_ENABLED", False),
             fade_price_below=get_float("POLYMARKET_BOT_FADE_BELOW", 0.05),
             fade_min_volume_24h=get_float("POLYMARKET_BOT_FADE_MIN_VOLUME24H", 50000.0),
@@ -218,6 +247,8 @@ class Config:
             ("fade_max_entry", 0.0, 1.0),
             ("fade_reversion_alpha", 0.0, 1.0),
             ("fade_min_edge", 0.0, 1.0),
+            ("cross_market_min_edge", 0.0, 1.0),
+            ("cross_market_max_edge", 0.0, 1.0),
             ("max_book_impact", 0.0, 1.0),
         ):
             value = getattr(self, name)
@@ -227,6 +258,8 @@ class Config:
             raise ConfigError("arb_max_edge must be >= arb_min_edge")
         if self.basket_max_edge < self.basket_min_edge:
             raise ConfigError("basket_max_edge must be >= basket_min_edge")
+        if self.cross_market_max_edge < self.cross_market_min_edge:
+            raise ConfigError("cross_market_max_edge must be >= cross_market_min_edge")
         if self.arb_min_seconds_left > self.arb_max_seconds_left:
             raise ConfigError("arb_min_seconds_left must be <= arb_max_seconds_left")
         if self.basket_max_outcomes < self.basket_min_outcomes:
@@ -244,11 +277,33 @@ class Config:
             raise ConfigError("stop_loss_pct must be non-negative")
         if self.max_theme_exposure_usd < 0:
             raise ConfigError("max_theme_exposure_usd must be non-negative")
+        if self.cross_market_scan_pages < 1:
+            raise ConfigError("cross_market_scan_pages must be >= 1")
 
     # --------------------------------------------------------------- helpers
     @property
     def is_live(self) -> bool:
         return self.mode == "live"
+
+    @property
+    def confirmed_cross_market_pairs(self) -> frozenset:
+        """Confirmed ladder pairs, each stored as a sorted condition-id pair.
+
+        Accepts ``A:B`` entries in either order, comma or semicolon separated,
+        so an operator can paste a pair the way it appears in a log without
+        worrying which market the bot called "lower".
+        """
+        out = set()
+        raw = self.cross_market_confirmed_pairs or ""
+        for chunk in raw.replace(";", ",").split(","):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            parts = [p.strip() for p in chunk.split(":") if p.strip()]
+            if len(parts) != 2:
+                continue
+            out.add(tuple(sorted(parts)))
+        return frozenset(out)
 
     @property
     def has_credentials(self) -> bool:

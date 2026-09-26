@@ -171,3 +171,134 @@ def test_execution_scales_down_when_notional_is_smaller_than_signal():
     # 10% of the original 100-set signal.
     assert result.notional_usd < Decimal("10")
     assert portfolio.open_positions == 1
+
+
+# ------------------------------------------------- per-leg venue routing
+
+
+def cross_market_signal():
+    """A two-leg signal whose legs sit in different markets."""
+    from polymarket_bot.models import Leg, Signal
+
+    n = Decimal("100")
+    return Signal(
+        kind="cross_market_arbitrage",
+        group_id="0xlo:0xhi",
+        title="BTC above $100k => BTC above $90k",
+        legs=(
+            Leg(
+                "yes-lo", "YES: BTC $90k", Decimal("0.45"), n, Decimal("0.45") * n,
+                condition_id="0xlo", tick_size=Decimal("0.001"), neg_risk=True,
+            ),
+            Leg(
+                "no-hi", "NO: BTC $100k", Decimal("0.45"), n, Decimal("0.45") * n,
+                condition_id="0xhi", tick_size=Decimal("0.01"), neg_risk=False,
+            ),
+        ),
+        edge_per_set=Decimal("0.10"),
+        cost_per_set=Decimal("0.90"),
+        payout_per_set=Decimal("1"),
+        confidence=0.0,
+        expected_profit_usd=n * Decimal("0.10"),
+        max_sets=n,
+        metadata={"cross_market": True, "leg_condition_ids": ("0xlo", "0xhi")},
+    )
+
+
+class RecordingBroker(PaperBroker):
+    def __init__(self, config):
+        super().__init__(config)
+        self.buy_calls: list[tuple] = []
+
+    def buy(self, *, token_id, usd, price, tick_size=Decimal("0.01"), neg_risk=False, order_type="FAK"):
+        self.buy_calls.append((token_id, tick_size, neg_risk))
+        return super().buy(
+            token_id=token_id, usd=usd, price=price, tick_size=tick_size,
+            neg_risk=neg_risk, order_type=order_type,
+        )
+
+
+def test_execution_routes_each_leg_through_its_own_market_settings():
+    """A cross-market position's legs belong to different markets. Sending both
+    through one group's tick size would place an order the venue rejects."""
+    config = make_config()
+    broker = RecordingBroker(config)
+    engine = ExecutionEngine(config, broker, Portfolio(Decimal("1000")))
+    result = engine.execute(cross_market_signal(), Decimal("90"), binary_group(), FEE_FREE)
+
+    assert result.ok
+    settings = {token: (tick, neg) for token, tick, neg in broker.buy_calls}
+    assert settings["yes-lo"] == (Decimal("0.001"), True)
+    assert settings["no-hi"] == (Decimal("0.01"), False)
+
+
+def test_execution_records_per_leg_condition_ids_on_a_cross_market_position():
+    """Settlement has to know both markets, so each leg keeps its own id."""
+    config = make_config()
+    portfolio = Portfolio(Decimal("1000"))
+    engine = ExecutionEngine(config, PaperBroker(config), portfolio)
+    result = engine.execute(cross_market_signal(), Decimal("90"), binary_group(), FEE_FREE)
+
+    assert result.ok
+    position = portfolio.positions[0]
+    by_token = {leg.token_id: leg for leg in position.legs}
+    assert by_token["yes-lo"].condition_id == "0xlo"
+    assert by_token["no-hi"].condition_id == "0xhi"
+    assert by_token["yes-lo"].tick_size == Decimal("0.001")
+    assert by_token["no-hi"].neg_risk is False
+
+
+def test_unwind_uses_each_legs_own_market_settings():
+    """The unwind path has to mirror the entry, or a failed cross-market trade
+    leaves a leg stranded on the wrong tick size."""
+
+    class FailingSecondLeg(RecordingBroker):
+        def buy(self, *, token_id, usd, price, tick_size=Decimal("0.01"), neg_risk=False, order_type="FAK"):
+            if token_id == "yes-lo":
+                self.buy_calls.append((token_id, tick_size, neg_risk))
+                return LegResult(token_id, "BUY", False, error="simulated rejection")
+            return super().buy(
+                token_id=token_id, usd=usd, price=price, tick_size=tick_size,
+                neg_risk=neg_risk, order_type=order_type,
+            )
+
+        def sell(self, *, token_id, shares, price, tick_size=Decimal("0.01"), neg_risk=False, order_type="FAK"):
+            self.sell_calls.append((token_id, tick_size, neg_risk))
+            return super().sell(
+                token_id=token_id, shares=shares, price=price, tick_size=tick_size,
+                neg_risk=neg_risk, order_type=order_type,
+            )
+
+    from polymarket_bot.models import Leg, Signal
+
+    # Make the leg that fails the smaller one, so the other leg is submitted
+    # first, fills, and then has to be unwound.
+    signal = Signal(
+        kind="cross_market_arbitrage",
+        group_id="0xlo:0xhi",
+        title="BTC above $100k => BTC above $90k",
+        legs=(
+            Leg("yes-lo", "YES: BTC $90k", Decimal("0.45"), Decimal("10"), Decimal("4.50"),
+                condition_id="0xlo", tick_size=Decimal("0.001"), neg_risk=True),
+            Leg("no-hi", "NO: BTC $100k", Decimal("0.45"), Decimal("100"), Decimal("45"),
+                condition_id="0xhi", tick_size=Decimal("0.01"), neg_risk=False),
+        ),
+        edge_per_set=Decimal("0.10"),
+        cost_per_set=Decimal("0.90"),
+        payout_per_set=Decimal("1"),
+        confidence=0.0,
+        expected_profit_usd=Decimal("10"),
+        max_sets=Decimal("100"),
+        metadata={"cross_market": True, "leg_condition_ids": ("0xlo", "0xhi")},
+    )
+
+    config = make_config()
+    broker = FailingSecondLeg(config)
+    broker.sell_calls = []
+    engine = ExecutionEngine(config, broker, Portfolio(Decimal("1000")))
+    result = engine.execute(signal, Decimal("49.5"), binary_group(), FEE_FREE)
+
+    assert not result.ok
+    assert result.unwound is True
+    assert [token for token, _t, _n in broker.sell_calls] == ["no-hi"]
+    assert broker.sell_calls[0][1] == Decimal("0.01")

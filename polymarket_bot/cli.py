@@ -33,7 +33,7 @@ STRATEGY_LABELS = {
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="polymarket-bot",
-        description="Polymarket trading bot: set arbitrage, basket arbitrage, fade extreme.",
+        description="Polymarket trading bot: set arbitrage, basket arbitrage, fade extreme, cross-market ladders.",
     )
     parser.add_argument("--version", action="version", version=f"polymarket-bot {__version__}")
     parser.add_argument("--env-file", default=None, help="path to a .env file (default: ./.env)")
@@ -51,6 +51,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("doctor", help="validate configuration and connectivity")
     sub.add_parser("config", help="print the effective configuration")
+
+    ladders = sub.add_parser(
+        "ladders",
+        help="list detected cross-market threshold ladders and their pair ids",
+    )
+    ladders.add_argument("--limit", type=int, default=None, help="markets to scan")
+    ladders.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     return parser
 
 
@@ -227,6 +234,84 @@ def cmd_scan(args) -> int:
     return 0
 
 
+def cmd_ladders(args) -> int:
+    """List candidate ladders so an operator can confirm the relation.
+
+    Detection is a guess from question wording. This command exists to make
+    that guess inspectable: it prints each pair with the ids needed to
+    allowlist it, and whether the resolution question really does imply the
+    other one is a judgement the operator has to make by opening both markets.
+    """
+    config = _load(args)
+    setup_logging(config.log_level, config.log_file, config.log_json)
+    from .cross_market import candidate_from_market
+    from .relations import adjacent_pairs, group_threshold_ladders
+
+    scanner = MarketScanner(config)
+    limit = args.limit or config.scan_limit
+    # Gamma caps a page at 100 rows, so ask for enough pages to reach the
+    # requested depth rather than silently scanning only the top 100.
+    pages = max(1, (limit + 99) // 100)
+    infos = scanner.fetch_binary_markets(limit=limit, pages=pages)
+    candidates = [c for c in (candidate_from_market(i) for i in infos) if c is not None]
+    ladders = group_threshold_ladders(candidates)
+    confirmed = config.confirmed_cross_market_pairs
+
+    if args.json:
+        payload = {
+            "markets_scanned": len(infos),
+            "candidates": len(candidates),
+            "ladders": [
+                {
+                    "subject": key.split("|")[0],
+                    "direction": key.split("|")[1],
+                    "members": [
+                        {
+                            "threshold": str(c.threshold),
+                            "market_id": c.market_id,
+                            "condition_id": c.condition_id,
+                            "question": c.question,
+                        }
+                        for c in ladder
+                    ],
+                    "pairs": [
+                        {
+                            "pair_id": f"{lo.condition_id}:{hi.condition_id}",
+                            "confirmed": tuple(sorted((lo.condition_id, hi.condition_id))) in confirmed,
+                            "lower": lo.question,
+                            "higher": hi.question,
+                        }
+                        for lo, hi in adjacent_pairs(ladder)
+                    ],
+                }
+                for key, ladder in ladders.items()
+            ],
+        }
+        print(json.dumps(payload, indent=2))
+        return 0
+
+    print(f"scanned {len(infos)} market(s), {len(candidates)} with a readable threshold")
+    if not ladders:
+        print("no threshold ladders found.")
+        return 0
+
+    for key, ladder in ladders.items():
+        subject, direction = key.rsplit("|", 1)
+        print(f"\n{direction.upper()} ladder: {subject}")
+        for candidate in ladder:
+            print(f"    {str(candidate.threshold).rjust(12)}  {candidate.question[:64]}")
+        for lo, hi in adjacent_pairs(ladder):
+            pair_id = f"{lo.condition_id}:{hi.condition_id}"
+            mark = "confirmed" if tuple(sorted((lo.condition_id, hi.condition_id))) in confirmed else "NOT confirmed"
+            print(f"    pair {mark}: {pair_id}")
+    print(
+        "\nDetection is a guess from wording, not a proof. Open both markets and check "
+        "the resolution rules agree before adding a pair to "
+        "POLYMARKET_BOT_CROSS_MARKET_CONFIRMED_PAIRS."
+    )
+    return 0
+
+
 def cmd_run(args) -> int:
     config = _load(args)
     setup_logging(config.log_level, config.log_file, config.log_json)
@@ -237,8 +322,15 @@ def cmd_run(args) -> int:
     print(f"mode: {config.mode}" + ("  (no real money moves)" if not config.is_live else "  (REAL ORDERS)"))
     print(
         f"strategies: arb={config.arb_enabled} basket={config.basket_enabled} fade={config.fade_enabled}"
+        f" cross_market={config.cross_market_enabled}"
         f" | max_order=${config.max_order_usd:.0f} | max_exposure=${config.max_total_exposure_usd:.0f}"
     )
+    if config.cross_market_enabled and config.is_live and not config.confirmed_cross_market_pairs:
+        print(
+            "NOTE: cross-market is on in live mode but no pairs are confirmed. "
+            "Run `polymarket-bot ladders` and set "
+            "POLYMARKET_BOT_CROSS_MARKET_CONFIRMED_PAIRS; nothing will trade until then."
+        )
     if config.is_live and not config.has_credentials:
         print("ERROR: live mode requested without credentials. Set POLYMARKET_PRIVATE_KEY.")
         return 2
@@ -264,6 +356,7 @@ def main(argv: list[str] | None = None) -> int:
         "scan": cmd_scan,
         "doctor": cmd_doctor,
         "config": cmd_config,
+        "ladders": cmd_ladders,
     }
     try:
         return handlers[args.command](args)

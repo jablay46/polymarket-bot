@@ -273,3 +273,32 @@ def test_portfolio_save_writes_json(tmp_path):
     portfolio.save(target)
     assert target.exists()
     assert "open_exposure" in target.read_text()
+
+
+def test_sizing_uses_the_stamped_fee_over_the_group_fee():
+    """A cross-market signal priced its fees from each leg's market. If sizing
+    re-derived them from one group fee, it could approve a size the real edge
+    does not pay for."""
+    stamped = signal(cost_per_set="0.90", sets="100000", payout="1")
+    stamped = replace(stamped, metadata={"fee_per_set": "0.05"})
+
+    manager = RiskManager(make_config(max_order_usd=1000, max_total_exposure_usd=100000))
+    decision = manager.size_signal(
+        stamped, FEE_FREE, available_cash=Decimal("10000"), open_exposure=Decimal("0")
+    )
+    assert decision.approved
+    # Budget 1000 / (0.90 cost + 0.05 fee) = 1052 whole sets.
+    assert decision.usd == Decimal("1052") * (Decimal("0.90") + Decimal("0.05"))
+
+
+def test_sizing_falls_back_when_the_stamped_fee_is_unparseable():
+    broken = signal(cost_per_set="0.90", sets="100000", payout="1")
+    broken = replace(broken, metadata={"fee_per_set": "not-a-number"})
+
+    manager = RiskManager(make_config(max_order_usd=1000, max_total_exposure_usd=100000))
+    decision = manager.size_signal(
+        broken, FEE_FREE, available_cash=Decimal("10000"), open_exposure=Decimal("0")
+    )
+    assert decision.approved
+    # With no usable stamped fee the free model is used: 1000 / 0.90 = 1111 sets.
+    assert decision.usd == Decimal("1111") * Decimal("0.90")

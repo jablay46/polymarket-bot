@@ -93,13 +93,19 @@ class ExecutionEngine:
         # Largest first, so the least certain leg commits the most capital.
         plan.sort(key=lambda item: item[1] * item[2], reverse=True)
 
-        tick = group.tick_size
-        neg_risk = group.neg_risk
+        by_token = {leg.token_id: leg for leg in signal.legs}
         results: list[LegResult] = []
         total_usd = ZERO
 
         for token_id, shares, price in plan:
+            leg = by_token.get(token_id)
             usd = shares * price
+            # Each leg carries its own venue settings. On a single-market
+            # signal they all match the group; on a cross-market signal they
+            # do not, and one group's tick size would be wrong for the other
+            # market's legs.
+            tick = leg.tick_size if leg is not None and leg.tick_size > 0 else group.tick_size
+            neg_risk = leg.neg_risk if leg is not None else group.neg_risk
             result = self.broker.buy(
                 token_id=token_id,
                 usd=usd,
@@ -115,7 +121,7 @@ class ExecutionEngine:
             else:
                 self.orders_failed += 1
                 log.warning("leg failed for %s: %s", signal.title[:40], result.error)
-                unwound = self._unwind(results, tick, neg_risk)
+                unwound = self._unwind(results, by_token, group)
                 if not unwound:
                     self.leg_risk_events += 1
                     log.error(
@@ -145,9 +151,21 @@ class ExecutionEngine:
                     for r in results
                     if r.ok and r.filled_shares > 0
                 )
+                # A leg's condition id comes from the leg itself when it has
+                # one. Falling back to the group's list keeps the single-market
+                # path working, where every leg shares one condition id.
                 leg_conditions = group.metadata.get("leg_condition_ids") or ()
                 fills_with_ids = tuple(
-                    (tid, name, shares, price, leg_conditions[i] if i < len(leg_conditions) else "")
+                    (
+                        tid,
+                        name,
+                        shares,
+                        price,
+                        (by_token[tid].condition_id if tid in by_token and by_token[tid].condition_id else "")
+                        or (leg_conditions[i] if i < len(leg_conditions) else ""),
+                        by_token[tid].tick_size if tid in by_token and by_token[tid].tick_size > 0 else group.tick_size,
+                        by_token[tid].neg_risk if tid in by_token else group.neg_risk,
+                    )
                     for i, (tid, name, shares, price) in enumerate(fills)
                 )
                 self.portfolio.open_position(
@@ -170,19 +188,26 @@ class ExecutionEngine:
                 return leg.outcome_name
         return token_id[:12]
 
-    def _unwind(self, results: list[LegResult], tick_size: Decimal, neg_risk: bool) -> bool:
-        """Sell back every leg that filled, best effort."""
+    def _unwind(self, results: list[LegResult], by_token: dict, group: MarketGroup) -> bool:
+        """Sell back every leg that filled, best effort.
+
+        Each unwind uses the same per-leg venue settings as the entry, so a
+        cross-market leg is unwound on its own market's tick size.
+        """
         filled = [r for r in results if r.ok and r.filled_shares > 0]
         if not filled:
             return True
         all_ok = True
         for result in filled:
+            leg = by_token.get(result.token_id)
+            tick = leg.tick_size if leg is not None and leg.tick_size > 0 else group.tick_size
+            neg_risk = leg.neg_risk if leg is not None else group.neg_risk
             price = self._unwind_price(result)
             sell = self.broker.sell(
                 token_id=result.token_id,
                 shares=result.filled_shares,
                 price=price,
-                tick_size=tick_size,
+                tick_size=tick,
                 neg_risk=neg_risk,
                 order_type="FAK",
             )

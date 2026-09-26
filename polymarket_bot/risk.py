@@ -149,6 +149,15 @@ class RiskManager:
 
     @staticmethod
     def _fee_per_set(signal: Signal, fee: FeeModel) -> Decimal:
+        # A cross-market signal priced its own fees from each leg's market,
+        # which can differ (different fee types). Re-deriving from the single
+        # group fee would size against an edge that isn't there.
+        stamped = signal.metadata.get("fee_per_set")
+        if stamped is not None:
+            try:
+                return Decimal(str(stamped))
+            except (ArithmeticError, ValueError):
+                pass
         if fee.is_fee_free or not signal.legs:
             return ZERO
         total = ZERO

@@ -96,6 +96,17 @@ def test_describe_redacts_secrets():
     assert "deadbeef" not in str(described)
 
 
+def test_cross_market_scan_pages_must_be_positive():
+    with pytest.raises(ConfigError):
+        Config.from_env(cross_market_scan_pages=0)
+
+
+def test_cross_market_defaults_are_off_and_ungated():
+    config = Config()
+    assert config.cross_market_enabled is False
+    assert config.confirmed_cross_market_pairs == frozenset()
+
+
 # ------------------------------------------------------------ data parsing
 
 
@@ -195,3 +206,71 @@ def test_fee_rate_uses_category_table():
     scanner = MarketScanner(Config.from_env())
     info = parse_market(dict(GAMMA_MARKET, feeType="crypto_fees_v2", feesEnabled=True))
     assert scanner.fee_rate_for(info) == pytest.approx(0.07)
+
+
+# ------------------------------------------------------------- pagination
+
+
+class PagedHttp:
+    """Serves ``total`` rows in 100-row pages, recording the offsets asked for."""
+
+    def __init__(self, total: int):
+        self.total = total
+        self.offsets: list[int] = []
+
+    def get(self, url, params=None):
+        params = params or {}
+        offset = params.get("offset", 0)
+        self.offsets.append(offset)
+        limit = params.get("limit", 100)
+        rows = []
+        for i in range(offset, min(offset + limit, self.total)):
+            rows.append(dict(GAMMA_MARKET, id=str(i), conditionId=f"0x{i}", question=f"Q{i}"))
+        return rows
+
+
+def test_fetch_binary_markets_pages_past_the_100_row_api_cap():
+    """Gamma returns at most 100 rows per request, so a deeper scan has to
+    walk the offset rather than silently stopping at the first page."""
+    scanner = MarketScanner(Config.from_env())
+    scanner.http = PagedHttp(total=250)
+
+    infos = scanner.fetch_binary_markets(limit=250, pages=3)
+
+    assert len(infos) == 250
+    assert scanner.http.offsets == [0, 100, 200]
+
+
+def test_fetch_binary_markets_stops_early_on_a_short_page():
+    scanner = MarketScanner(Config.from_env())
+    scanner.http = PagedHttp(total=150)
+
+    infos = scanner.fetch_binary_markets(limit=300, pages=5)
+
+    assert len(infos) == 150
+    # The third page came back short, so no fourth request is made.
+    assert scanner.http.offsets == [0, 100]
+
+
+def test_fetch_binary_markets_deduplicates_across_pages():
+    """A market that shifts rank between page requests must not be counted
+    twice, or the ladder scan would see phantom duplicates."""
+
+    class ShiftingHttp(PagedHttp):
+        def get(self, url, params=None):
+            params = params or {}
+            offset = params.get("offset", 0)
+            self.offsets.append(offset)
+            rows = []
+            for i in range(offset, min(offset + 100, self.total)):
+                rows.append(dict(GAMMA_MARKET, id=str(i), conditionId=f"0x{i}", question=f"Q{i}"))
+            if offset == 0:
+                rows.append(dict(GAMMA_MARKET, id="100", conditionId="0x100", question="dup"))
+            return rows
+
+    scanner = MarketScanner(Config.from_env())
+    scanner.http = ShiftingHttp(total=150)
+
+    infos = scanner.fetch_binary_markets(limit=200, pages=2)
+
+    assert len({i.market_id for i in infos}) == len(infos)

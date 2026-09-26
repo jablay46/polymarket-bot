@@ -17,9 +17,14 @@ not the same claim, and are not bound by the implication at all. A false
 grouping does not average out the way a losing bet does: if the relation
 does not actually hold, the "arbitrage" is a directional bet with a
 misleading label. Every relation this module reports should be reviewed by
-a human before it is traded, and :class:`CrossMarketArbitrageStrategy`
-therefore only emits signals — it does not wire itself into automatic
-execution. See ``strategies.py`` for how that boundary is kept.
+a human before it is traded.
+
+That review is enforced, not merely requested. In paper mode
+:class:`CrossMarketArbitrageStrategy` will price any detected pair so an
+operator can watch it fill; in live mode it refuses every pair whose two
+condition ids are not named in ``POLYMARKET_BOT_CROSS_MARKET_CONFIRMED_PAIRS``,
+and that list starts empty. Detection can be automatic because the gate on
+the way to real money is not.
 """
 
 from __future__ import annotations
@@ -27,6 +32,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from decimal import Decimal
+
+from .models import ZERO
 
 # Words that mark a threshold as crossed from above or from below. Kept as
 # shared fragments so the threshold matcher and the direction matcher can
@@ -122,6 +129,15 @@ class ThresholdCandidate:
     mix directions, and ``cross_market`` refuses to price a pair whose
     directions disagree.
     """
+    # Venue settings travel with the candidate because the two legs of a
+    # cross-market pair sit in different markets and can disagree.
+    tick_size: Decimal = Decimal("0.01")
+    neg_risk: bool = False
+    volume_24h: Decimal = ZERO
+    liquidity: Decimal = ZERO
+    seconds_to_end: float | None = None
+    fees_enabled: bool = False
+    fee_type: str | None = None
 
 
 def group_threshold_ladders(

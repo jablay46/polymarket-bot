@@ -203,3 +203,129 @@ def test_run_forever_stops_after_max_cycles():
     engine.run_forever(max_cycles=2)
     # Two cycles ran, so exactly one order was placed (the second was cooled down).
     assert engine.portfolio.open_positions == 1
+
+
+# ----------------------------------------------------- cross-market wiring
+
+
+def ladder_group(threshold: str, condition_id: str, tick: str = "0.01") -> MarketGroup:
+    """A binary market whose question carries a BTC threshold."""
+    def book(ask, bid):
+        return OrderBook.from_api(
+            {"asks": [{"price": ask, "size": "500"}], "bids": [{"price": bid, "size": "500"}], "tick_size": tick}
+        )
+
+    return MarketGroup(
+        group_id=condition_id,
+        title=f"Will Bitcoin be above ${threshold} by December 31?",
+        outcomes=(
+            Outcome(0, "Yes", f"yes-{threshold}", book("0.45", "0.44")),
+            Outcome(1, "No", f"no-{threshold}", book("0.45", "0.44")),
+        ),
+        volume_24h=Decimal("100000"),
+        liquidity=Decimal("50000"),
+        seconds_to_end=86400,
+        is_binary=True,
+        tick_size=Decimal(tick),
+        metadata={"condition_id": condition_id, "market_id": condition_id},
+    )
+
+
+class LadderScanner(FakeScanner):
+    """Serves books for ladder tokens so the cross-market path can price."""
+
+    def fetch_books(self, token_ids):
+        books = {}
+        for group in self._groups:
+            for outcome in group.outcomes:
+                if outcome.token_id in token_ids:
+                    books[outcome.token_id] = outcome.book
+        return books
+
+
+def build_ladder_engine(groups, **overrides):
+    # Only the cross-market strategy is under test here; the per-market
+    # strategies are switched off so a set-arb on the same books cannot
+    # account for the fills being asserted on.
+    defaults = dict(
+        cross_market_enabled=True,
+        arb_enabled=False,
+        basket_enabled=False,
+        fade_enabled=False,
+    )
+    defaults.update(overrides)
+    config = make_config(**defaults)
+    engine = TradingEngine(config)
+    engine.scanner = LadderScanner(groups)
+    engine.broker = PaperBroker(config)
+    from polymarket_bot.execution import ExecutionEngine
+
+    engine.portfolio = Portfolio(Decimal("1000"))
+    engine.execution = ExecutionEngine(config, engine.broker, engine.portfolio)
+    return engine
+
+
+def test_cross_market_cycle_trades_a_priced_violation_in_paper_mode():
+    groups = [ladder_group("90,000", "0xlo"), ladder_group("100,000", "0xhi")]
+    engine = build_ladder_engine(groups)
+    stats = engine.run_cycle()
+    assert stats.orders_filled == 1
+    assert engine.portfolio.open_positions == 1
+
+
+def test_cross_market_is_off_by_default():
+    groups = [ladder_group("90,000", "0xlo"), ladder_group("100,000", "0xhi")]
+    engine = build_ladder_engine(groups, cross_market_enabled=False)
+    stats = engine.run_cycle()
+    assert stats.orders_filled == 0
+
+
+def test_cross_market_cycle_refuses_unconfirmed_pairs_in_live_mode():
+    """The end-to-end guard: even with everything else enabled, live mode must
+    not trade a ladder whose relation no human has confirmed.
+
+    The engine runs in paper mode here (a live broker needs credentials), and
+    only the cross-market strategy is switched to a live-mode config, which is
+    exactly the gate under test.
+    """
+    from polymarket_bot.cross_market import CrossMarketArbitrageStrategy
+
+    groups = [ladder_group("90,000", "0xlo"), ladder_group("100,000", "0xhi")]
+    engine = build_ladder_engine(groups)
+    engine.cross_market = CrossMarketArbitrageStrategy(make_config(mode="live"))
+    stats = engine.run_cycle()
+    assert stats.orders_filled == 0
+
+
+def test_cross_market_cycle_trades_a_confirmed_pair_in_live_mode():
+    from polymarket_bot.cross_market import CrossMarketArbitrageStrategy
+
+    groups = [ladder_group("90,000", "0xlo"), ladder_group("100,000", "0xhi")]
+    engine = build_ladder_engine(groups)
+    engine.cross_market = CrossMarketArbitrageStrategy(
+        make_config(mode="live", cross_market_confirmed_pairs="0xlo:0xhi")
+    )
+    stats = engine.run_cycle()
+    assert stats.orders_filled == 1
+
+
+def test_cross_market_position_records_both_condition_ids():
+    """One position spans two markets, so settlement has to know both."""
+    groups = [ladder_group("90,000", "0xlo"), ladder_group("100,000", "0xhi")]
+    engine = build_ladder_engine(groups)
+    engine.run_cycle()
+    position = engine.portfolio.positions[0]
+    assert {leg.condition_id for leg in position.legs} == {"0xlo", "0xhi"}
+    assert set(engine._condition_ids(position)) == {"0xlo", "0xhi"}
+
+
+def test_cross_market_does_not_rebuy_a_held_pair():
+    """The duplicate guard must cover cross-market positions, or a re-scan
+    would stack a second set on top of the first."""
+    groups = [ladder_group("90,000", "0xlo"), ladder_group("100,000", "0xhi")]
+    engine = build_ladder_engine(groups)
+    engine.run_cycle()
+    engine._cooldowns.clear()
+    second = engine.run_cycle()
+    assert second.orders_filled == 0
+    assert engine.portfolio.open_positions == 1

@@ -164,8 +164,6 @@ class ExitEngine:
     # -------------------------------------------------------------- execution
     def close(self, position: Position, group: MarketGroup, decision: ExitDecision) -> bool:
         """Submit the sell orders for a position and book the result."""
-        tick = group.tick_size
-        neg_risk = group.neg_risk
         sets = position.guaranteed_sets
         proceeds = ZERO
         sold: dict[str, Decimal] = {}
@@ -179,12 +177,16 @@ class ExitEngine:
                 all_ok = False
                 log.warning("no bid to exit %s (%s)", position.title[:40], leg.outcome_name)
                 break
+            # Each leg exits on its own market's venue settings. A cross-market
+            # position holds legs in two markets, so the position-wide tick
+            # size would be wrong for one of them.
+            tick = leg.tick_size if leg.tick_size > 0 else group.tick_size
             result = self.broker.sell(
                 token_id=leg.token_id,
                 shares=sell_shares,
                 price=price,
                 tick_size=tick,
-                neg_risk=neg_risk,
+                neg_risk=leg.neg_risk,
                 order_type=self.config.live_order_type,
             )
             if result.ok and result.filled_shares > 0:

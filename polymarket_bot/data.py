@@ -281,26 +281,42 @@ class MarketScanner:
             )
 
     # ---------------------------------------------------------- discovery
-    def fetch_binary_markets(self, limit: int | None = None) -> list[MarketInfo]:
-        """Highest 24h-volume active markets, as binary candidates."""
-        limit = limit or self.config.scan_limit
-        raw = self.http.get(
-            f"{self.config.gamma_host}/markets",
-            {
-                "limit": limit,
-                "active": "true",
-                "closed": "false",
-                "order": "volume24hr",
-                "ascending": "false",
-            },
-        )
+    def fetch_binary_markets(self, limit: int | None = None, pages: int = 1) -> list[MarketInfo]:
+        """Highest 24h-volume active markets, as binary candidates.
+
+        Gamma caps a page at 100 rows, so ``pages`` walks the offset. The
+        cross-market ladder scan needs the deeper reach: crypto threshold
+        markets sit well below the top of the volume ranking.
+        """
+        page_size = 100
+        pages = max(1, pages)
+        limit = limit if limit is not None else page_size * pages
         out: list[MarketInfo] = []
-        for item in raw or []:
-            info = parse_market(item)
-            if info is not None:
+        seen: set[str] = set()
+        for page in range(pages):
+            raw = self.http.get(
+                f"{self.config.gamma_host}/markets",
+                {
+                    "limit": page_size,
+                    "offset": page * page_size,
+                    "active": "true",
+                    "closed": "false",
+                    "order": "volume24hr",
+                    "ascending": "false",
+                },
+            )
+            if not raw:
+                break
+            for item in raw:
+                info = parse_market(item)
+                if info is None or info.market_id in seen:
+                    continue
+                seen.add(info.market_id)
                 out.append(info)
+            if len(raw) < page_size:
+                break
         self.stats.markets_seen += len(out)
-        return out
+        return out[:limit]
 
     def fetch_neg_risk_events(self, limit: int | None = None) -> list[list[MarketInfo]]:
         """Multi-outcome neg-risk events, returned as candidate outcome sets."""
@@ -582,8 +598,12 @@ class MarketScanner:
         groups: list[MarketGroup] = []
 
         binary_infos: list[MarketInfo] = []
-        if self.config.arb_enabled or self.config.fade_enabled:
-            binary_infos = self.fetch_binary_markets()
+        if self.config.arb_enabled or self.config.fade_enabled or self.config.cross_market_enabled:
+            # The cross-market scan needs binary markets even when the
+            # per-market strategies are off, and it needs to look deeper than
+            # one page because ladder markets are not top-of-volume.
+            pages = self.config.cross_market_scan_pages if self.config.cross_market_enabled else 1
+            binary_infos = self.fetch_binary_markets(pages=pages)
             binary_infos = [i for i in binary_infos if i.is_binary and i.enable_order_book and i.accepting_orders]
 
         basket_infos: list[list[MarketInfo]] = []

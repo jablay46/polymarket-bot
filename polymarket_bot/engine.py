@@ -15,6 +15,7 @@ from decimal import Decimal
 
 from .brokers import BrokerError, build_broker
 from .config import Config
+from .cross_market import CrossMarketArbitrageStrategy, candidate_from_market
 from .data import MarketScanner
 from .execution import ExecutionEngine, ExecutionResult
 from .exits import ExitEngine
@@ -26,6 +27,41 @@ from .risk import RiskManager
 from .strategies import StrategyEngine
 
 log = get_logger("engine")
+
+
+@dataclass
+class _MarketView:
+    """Adapt a scanned :class:`MarketGroup` to the shape ladder detection wants.
+
+    ``candidate_from_market`` reads the same fields a ``MarketInfo`` carries,
+    but the engine works with built groups whose books are already attached,
+    so this view avoids a second round of book fetches.
+    """
+
+    market_id: str
+    condition_id: str
+    question: str
+    token_ids: tuple
+    tick_size: Decimal
+    neg_risk: bool
+    volume_24h: Decimal
+    liquidity: Decimal
+    seconds_to_end: float | None
+    fees_enabled: bool
+    fee_type: str | None
+
+    def __init__(self, group: MarketGroup) -> None:
+        self.market_id = str(group.metadata.get("market_id") or group.group_id)
+        self.condition_id = str(group.metadata.get("condition_id") or group.group_id)
+        self.question = group.title
+        self.token_ids = tuple(o.token_id for o in group.outcomes)
+        self.tick_size = group.tick_size
+        self.neg_risk = bool(group.neg_risk)
+        self.volume_24h = group.volume_24h or ZERO
+        self.liquidity = group.liquidity or ZERO
+        self.seconds_to_end = group.seconds_to_end
+        self.fees_enabled = bool(group.fees_enabled)
+        self.fee_type = group.metadata.get("fee_type")
 
 
 @dataclass
@@ -73,6 +109,7 @@ class TradingEngine:
     execution: ExecutionEngine = None  # type: ignore[assignment]
     broker: object = None
     exits: ExitEngine = None  # type: ignore[assignment]
+    cross_market: CrossMarketArbitrageStrategy = None  # type: ignore[assignment]
     _cooldowns: dict = field(default_factory=dict)
     _price_memory: dict = field(default_factory=dict)
     _themes: dict = field(default_factory=dict)
@@ -93,6 +130,8 @@ class TradingEngine:
             self.execution = ExecutionEngine(self.config, self.broker, self.portfolio)
         if self.exits is None:
             self.exits = ExitEngine(self.config, self.broker, self.portfolio, self.scanner)
+        if self.cross_market is None:
+            self.cross_market = CrossMarketArbitrageStrategy(self.config)
 
     # ---------------------------------------------------------------- helpers
     def _fee_model(self, group: MarketGroup) -> FeeModel:
@@ -251,8 +290,112 @@ class TradingEngine:
                     stats.errors += 1
                     log.warning("NOT FILLED %s", result.describe())
 
+        if self.config.cross_market_enabled:
+            self._run_cross_market(groups, stats)
+
         log.info("cycle: %s | portfolio: %s", stats.as_dict(), self.portfolio.summary() if self.portfolio else "n/a")
         return stats
+
+    # ----------------------------------------------------------- cross-market
+    def _run_cross_market(self, groups: list[MarketGroup], stats: CycleStats) -> None:
+        """Evaluate threshold-ladder pairs across the scanned binary markets.
+
+        Separate from the per-group loop because a ladder pair spans two
+        markets, so it has no single group to be evaluated inside. Every
+        signal is still gated by the same risk manager and by the confirmed
+        pair list, which is what keeps a keyword-inferred relation from
+        reaching live execution unreviewed.
+        """
+        markets = [
+            _MarketView(g)
+            for g in groups
+            if g.is_binary and not g.neg_risk and len(g.outcomes) == 2
+        ]
+        if len(markets) < 2:
+            return
+        try:
+            signals = self.cross_market.find_signals(markets, self.scanner, self._fee_for_candidate)
+        except Exception as exc:  # noqa: BLE001 - one bad ladder must not stop the loop
+            log.warning("cross-market scan failed: %s", exc)
+            stats.errors += 1
+            return
+
+        for sig in signals:
+            stats.signals_found += 1
+            stats.best_edge = max(stats.best_edge, sig.edge_per_set)
+            group = self._cross_group_for(sig, groups)
+            if group is None:
+                stats.signals_rejected += 1
+                continue
+            if self._on_cooldown(sig.group_id, time.monotonic()):
+                stats.signals_rejected += 1
+                continue
+            if self.portfolio is not None and (
+                self.portfolio.holds(sig.group_id)
+                or any(self.portfolio.holds(c) for c in sig.metadata.get("leg_condition_ids", ()))
+            ):
+                # One leg already held means the other would leave a naked
+                # position on the first market rather than completing a set.
+                stats.signals_rejected += 1
+                log.debug("already holding a leg of %s; skipping", sig.title[:48])
+                continue
+            if not sig.metadata.get("confirmed_pair"):
+                log.warning(
+                    "UNCONFIRMED cross-market relation (paper signal only): %s — %s",
+                    sig.title[:60],
+                    sig.metadata.get("warning", ""),
+                )
+            fee = self._fee_model(group)
+            decision = self.risk.size_signal(
+                sig,
+                fee,
+                available_cash=self._available_cash(),
+                open_exposure=self._open_exposure(),
+                open_positions=self.portfolio.open_positions if self.portfolio else 0,
+                theme_exposure=ZERO,
+            )
+            if not decision.approved:
+                stats.signals_rejected += 1
+                log.debug("risk rejected %s: %s", sig.describe(), decision.reason)
+                continue
+            if not self.risk.rate_ok():
+                stats.signals_rejected += 1
+                log.warning("rate limit hit; skipping %s", sig.describe())
+                continue
+            result = self._execute(sig, decision.usd, group, fee)
+            if result.ok:
+                stats.orders_filled += 1
+                stats.notional_usd += result.notional_usd
+                log.info("FILLED %s", result.describe())
+            else:
+                stats.errors += 1
+                log.warning("NOT FILLED %s", result.describe())
+
+    def _fee_for_candidate(self, candidate) -> FeeModel:
+        """Fee model for a ladder candidate, from its own market's settings."""
+        return FeeModel.for_market(
+            fees_enabled=bool(getattr(candidate, "fees_enabled", False)),
+            fee_type=getattr(candidate, "fee_type", None),
+            override=self.config.taker_fee_rate_override or None,
+            safety_multiplier=self.config.fee_safety_multiplier,
+            maker=self.config.assume_maker,
+        )
+
+    def _cross_group_for(self, sig: Signal, groups: list[MarketGroup]) -> MarketGroup | None:
+        """Build the group a cross-market signal is executed against.
+
+        Execution needs one group for venue-level defaults and position
+        bookkeeping, but the signal's legs each carry their own market's
+        settings, so this only supplies the fallback values.
+        """
+        wanted = set(sig.metadata.get("leg_condition_ids", ()))
+        for group in groups:
+            if group.group_id in wanted:
+                return group
+        for group in groups:
+            if group.metadata.get("condition_id") in wanted:
+                return group
+        return None
 
     # ------------------------------------------------------------------ exits
     def _settle_positions(self, stats: CycleStats) -> None:
@@ -410,6 +553,7 @@ class TradingEngine:
                     ("set_arb", self.config.arb_enabled),
                     ("basket_arb", self.config.basket_enabled),
                     ("fade", self.config.fade_enabled),
+                    ("cross_market", self.config.cross_market_enabled),
                 )
                 if on
             ),
