@@ -1,0 +1,11 @@
+# Paper mode (default) needs no third-party packages at all.
+
+# ---- Live trading: pick one client ----
+# Recommended: current official SDK (import name: polymarket)
+polymarket-client>=0.11.0
+
+# Alternative: previous official CLOB client
+py-clob-client-v2>=1.2.0
+
+# ---- Development ----
+# pytest>=8.0
