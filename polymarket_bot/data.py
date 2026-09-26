@@ -16,6 +16,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
+from decimal import Decimal
 
 from .config import Config
 from .fees import resolve_taker_rate
@@ -32,6 +33,27 @@ from .models import (
 log = get_logger("data")
 
 _BATCH_LIMIT = 500
+
+# Tags that describe a whole category rather than a shared story. Using one of
+# these as a theme would lump unrelated markets into a single risk bucket.
+_BROAD_TAGS = frozenset(
+    {
+        "all",
+        "sports",
+        "games",
+        "politics",
+        "geopolitics",
+        "world",
+        "crypto",
+        "economy",
+        "elections",
+        "recurring",
+        "culture",
+        "tech",
+        "business",
+        "news",
+    }
+)
 
 
 class DataError(RuntimeError):
@@ -75,7 +97,9 @@ class HttpClient:
     def get(self, url: str, params: dict | None = None) -> object:
         if params:
             clean = {k: v for k, v in params.items() if v is not None}
-            url = f"{url}?{urllib.parse.urlencode(clean)}"
+            # Gamma needs repeated keys for multi-value filters; comma-joining
+            # them silently matches nothing.
+            url = f"{url}?{urllib.parse.urlencode(clean, doseq=True)}"
         return self._request(url)
 
     def post(self, url: str, payload: object) -> object:
@@ -138,7 +162,17 @@ class MarketInfo:
 
 
 def parse_market(raw: dict, event: dict | None = None) -> MarketInfo | None:
-    """Convert a raw Gamma market dict into :class:`MarketInfo`."""
+    """Normalize one Gamma market payload.
+
+    Gamma embeds the parent event under ``events`` for markets fetched from
+    ``/markets``; that is the only place the event id and title appear, so it
+    is used when no explicit event was passed. Themes and neg-risk grouping
+    both depend on that id.
+    """
+    if event is None:
+        embedded = raw.get("events") or []
+        if embedded and isinstance(embedded[0], dict):
+            event = embedded[0]
     if not raw:
         return None
     token_ids = _parse_json_field(raw.get("clobTokenIds"), [])
@@ -166,6 +200,55 @@ def parse_market(raw: dict, event: dict | None = None) -> MarketInfo | None:
         event_title=str((event or {}).get("title") or ""),
         accepting_orders=bool(raw.get("acceptingOrders", True)),
         enable_order_book=bool(raw.get("enableOrderBook", True)),
+    )
+
+
+@dataclass(frozen=True)
+class Resolution:
+    """The settled outcome of a market.
+
+    ``winning_token_ids`` holds the token(s) that pay $1. A binary market has
+    exactly one; a multi-outcome set can in principle have several.
+    """
+
+    condition_id: str
+    resolved: bool
+    winning_token_ids: tuple[str, ...] = ()
+    outcome_prices: tuple[Decimal, ...] = ()
+    token_ids: tuple[str, ...] = ()
+    closed: bool = False
+    raw_status: str = ""
+
+
+def parse_resolution(raw: dict) -> Resolution | None:
+    """Build a :class:`Resolution` from a Gamma market object.
+
+    A market is treated as settled only when it is closed *and* its prices have
+    snapped to a winner. ``umaResolutionStatus`` is recorded but not required,
+    because it is absent on some older markets.
+    """
+    if not raw:
+        return None
+    token_ids = tuple(str(t) for t in _parse_json_field(raw.get("clobTokenIds"), []))
+    prices_raw = _parse_json_field(raw.get("outcomePrices"), [])
+    prices = tuple(to_decimal(p) for p in prices_raw)
+    status = str(raw.get("umaResolutionStatus") or "")
+    closed = bool(raw.get("closed", False))
+
+    winners: list[str] = []
+    if prices and len(prices) == len(token_ids):
+        for token, price in zip(token_ids, prices):
+            if price >= Decimal("0.99"):
+                winners.append(token)
+    resolved = closed and bool(winners)
+    return Resolution(
+        condition_id=str(raw.get("conditionId") or ""),
+        resolved=resolved,
+        winning_token_ids=tuple(winners),
+        outcome_prices=prices,
+        token_ids=token_ids,
+        closed=closed,
+        raw_status=status,
     )
 
 
@@ -251,11 +334,82 @@ class MarketScanner:
                 groups.append(infos)
         return groups
 
+    # --------------------------------------------------------------- themes
+    def fetch_themes(self, event_ids: list[str]) -> dict[str, str]:
+        """Map event id -> correlation theme, from the event's most specific tag.
+
+        Broad tags like ``sports`` group hundreds of unrelated markets, so the
+        rarest tag on the event is used: it is the one that actually describes
+        the shared story ("iran", "strait-of-hormuz").
+        """
+        unique = [e for e in dict.fromkeys(event_ids) if e]
+        if not unique:
+            return {}
+        events: list[dict] = []
+        for start in range(0, len(unique), _BATCH_LIMIT):
+            chunk = unique[start : start + _BATCH_LIMIT]
+            try:
+                raw = self.http.get(f"{self.config.gamma_host}/events", {"id": chunk})
+            except DataError as exc:
+                log.debug("theme lookup failed: %s", exc)
+                continue
+            events.extend(e for e in (raw or []) if isinstance(e, dict))
+
+        # Count how many of *our* events carry each tag, then prefer the tag
+        # that is most specific to this batch.
+        tag_counts: dict[str, int] = {}
+        per_event: list[tuple[str, list[str]]] = []
+        for event in events:
+            tags = [
+                str(t.get("slug"))
+                for t in (event.get("tags") or [])
+                if isinstance(t, dict) and t.get("slug")
+            ]
+            tags = [t for t in tags if t not in _BROAD_TAGS]
+            per_event.append((str(event.get("id") or ""), tags))
+            for tag in tags:
+                tag_counts[tag] = tag_counts.get(tag, 0) + 1
+
+        out: dict[str, str] = {}
+        for event_id, tags in per_event:
+            if not event_id or not tags:
+                continue
+            # Rarest tag wins; ties broken by name for determinism.
+            out[event_id] = min(tags, key=lambda t: (tag_counts[t], t))
+        return out
+
+    # ---------------------------------------------------------- resolutions
+    def fetch_resolutions(self, condition_ids: list[str]) -> dict[str, Resolution]:
+        """Look up settlement state for markets we hold.
+
+        Gamma hides closed markets by default, so ``closed=true`` must be sent
+        explicitly or every settled market silently reads back as unknown.
+        """
+        unique = [c for c in dict.fromkeys(condition_ids) if c]
+        if not unique:
+            return {}
+        out: dict[str, Resolution] = {}
+        for start in range(0, len(unique), _BATCH_LIMIT):
+            chunk = unique[start : start + _BATCH_LIMIT]
+            try:
+                raw = self.http.get(
+                    f"{self.config.gamma_host}/markets",
+                    {"condition_ids": chunk, "closed": "true", "limit": len(chunk)},
+                )
+            except DataError as exc:
+                log.warning("resolution lookup failed: %s", exc)
+                continue
+            for item in raw or []:
+                res = parse_resolution(item)
+                if res is not None and res.condition_id:
+                    out[res.condition_id] = res
+        return out
+
     # --------------------------------------------------------------- books
     def fetch_books(self, token_ids: list[str]) -> dict[str, OrderBook]:
         """Fetch many order books, batching where possible."""
-        books: dict[str, OrderBook] = {}
         unique = [t for t in dict.fromkeys(token_ids) if t]
+        books: dict[str, OrderBook] = {}
         for start in range(0, len(unique), _BATCH_LIMIT):
             chunk = unique[start : start + _BATCH_LIMIT]
             try:
@@ -372,6 +526,9 @@ class MarketScanner:
                 "fee_type": info.fee_type,
                 "min_order_size": str(info.min_order_size),
                 "yes_index": yes_idx,
+                "event_id": info.event_id,
+                "condition_id": info.condition_id,
+                "leg_condition_ids": (info.condition_id, info.condition_id),
             },
         )
 
@@ -409,7 +566,14 @@ class MarketScanner:
             is_binary=False,
             fees_enabled=any(i.fees_enabled for i in infos),
             tick_size=first.tick_size,
-            metadata={"event_id": first.event_id, "fee_type": first.fee_type, "n_markets": len(infos)},
+            metadata={
+                "event_id": first.event_id,
+                "fee_type": first.fee_type,
+                "n_markets": len(infos),
+                "leg_condition_ids": tuple(
+                    i.condition_id for i in infos if i.yes_index is not None
+                ),
+            },
         )
 
     # ------------------------------------------------------------- pipeline

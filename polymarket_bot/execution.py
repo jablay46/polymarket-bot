@@ -64,7 +64,14 @@ class ExecutionEngine:
         self.leg_risk_events = 0
 
     # ------------------------------------------------------------ entrypoint
-    def execute(self, signal: Signal, notional_usd: Decimal, group: MarketGroup, fee: FeeModel) -> ExecutionResult:
+    def execute(
+        self,
+        signal: Signal,
+        notional_usd: Decimal,
+        group: MarketGroup,
+        fee: FeeModel,
+        theme: str = "",
+    ) -> ExecutionResult:
         if notional_usd <= 0:
             return ExecutionResult(False, signal.kind, signal.title, error="non-positive notional")
         if signal.max_sets <= 0:
@@ -128,10 +135,40 @@ class ExecutionEngine:
         # Success. Record the position for reporting and paper accounting.
         if self.portfolio is not None:
             try:
-                self.portfolio.open_position(signal, total_usd)
+                fills = tuple(
+                    (
+                        r.token_id,
+                        self._outcome_name(signal, r.token_id),
+                        r.filled_shares,
+                        (r.filled_usd / r.filled_shares) if r.filled_shares > 0 else ZERO,
+                    )
+                    for r in results
+                    if r.ok and r.filled_shares > 0
+                )
+                leg_conditions = group.metadata.get("leg_condition_ids") or ()
+                fills_with_ids = tuple(
+                    (tid, name, shares, price, leg_conditions[i] if i < len(leg_conditions) else "")
+                    for i, (tid, name, shares, price) in enumerate(fills)
+                )
+                self.portfolio.open_position(
+                    signal,
+                    total_usd,
+                    fills=fills_with_ids,
+                    condition_id=group.metadata.get("condition_id", ""),
+                    theme=theme,
+                    tick_size=group.tick_size,
+                    neg_risk=group.neg_risk,
+                )
             except ValueError as exc:
                 log.warning("could not record position: %s", exc)
         return ExecutionResult(True, signal.kind, signal.title, notional_usd=total_usd, legs=results)
+
+    @staticmethod
+    def _outcome_name(signal: Signal, token_id: str) -> str:
+        for leg in signal.legs:
+            if leg.token_id == token_id:
+                return leg.outcome_name
+        return token_id[:12]
 
     def _unwind(self, results: list[LegResult], tick_size: Decimal, neg_risk: bool) -> bool:
         """Sell back every leg that filled, best effort."""

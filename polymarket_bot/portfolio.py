@@ -21,6 +21,21 @@ from .models import ONE, ZERO, Signal
 log = get_logger("portfolio")
 
 
+@dataclass(frozen=True)
+class PositionLeg:
+    """One held leg: how many shares, and at what average entry price."""
+
+    token_id: str
+    outcome_name: str
+    shares: Decimal
+    entry_price: Decimal
+    condition_id: str = ""
+
+    @property
+    def cost_usd(self) -> Decimal:
+        return self.shares * self.entry_price
+
+
 @dataclass
 class Position:
     """The legs bought together for one signal.
@@ -40,10 +55,44 @@ class Position:
     edge_per_set: Decimal
     expected_payout_usd: Decimal
     hedged: bool = True
+    legs: tuple[PositionLeg, ...] = ()
+    condition_id: str = ""
+    theme: str = ""
+    tick_size: Decimal = Decimal("0.01")
+    neg_risk: bool = False
 
     @property
     def expected_profit_usd(self) -> Decimal:
         return self.expected_payout_usd - self.cost_usd
+
+    @property
+    def guaranteed_sets(self) -> Decimal:
+        """Complete sets actually held: the smallest leg, not the largest.
+
+        A pair of legs with unequal fills only locks in ``min(shares)``; the
+        excess on the bigger leg is unhedged directional risk.
+        """
+        if not self.legs:
+            return self.shares
+        return min((leg.shares for leg in self.legs), default=self.shares)
+
+    def leg_for(self, token_id: str) -> PositionLeg | None:
+        for leg in self.legs:
+            if leg.token_id == token_id:
+                return leg
+        return None
+
+    def settlement_payout(self, winning_token_ids: tuple[str, ...]) -> Decimal:
+        """Cash returned when the market settles.
+
+        Every held share of a winning token pays $1; losing tokens pay nothing.
+        """
+        winners = set(winning_token_ids)
+        payout = ZERO
+        for leg in self.legs:
+            if leg.token_id in winners:
+                payout += leg.shares
+        return payout
 
 
 @dataclass
@@ -100,28 +149,94 @@ class Portfolio:
         return self.cash
 
     # -------------------------------------------------------------- mutation
-    def open_position(self, signal: Signal, cost_usd: Decimal) -> Position:
+    def holds(self, group_id: str) -> bool:
+        """True if a position is already open on this market.
+
+        Keyed on ``group_id`` (the condition id), which is stable across
+        cycles, so a market can never be bought twice.
+        """
+        if not group_id:
+            return False
+        with self._lock:
+            return any(p.group_id == group_id for p in self.positions)
+
+    def theme_exposure(self, theme: str) -> Decimal:
+        """Open exposure across every position sharing a correlation theme."""
+        if not theme:
+            return ZERO
+        with self._lock:
+            return sum((p.cost_usd for p in self.positions if p.theme == theme), ZERO)
+
+    def open_position(
+        self,
+        signal: Signal,
+        cost_usd: Decimal,
+        *,
+        fills: tuple[tuple, ...] = (),
+        condition_id: str = "",
+        theme: str = "",
+        tick_size: Decimal = Decimal("0.01"),
+        neg_risk: bool = False,
+    ) -> Position:
         """Record a filled position and debit the cash it consumed.
 
-        ``cost_usd`` is the cash actually spent on the fills. ``signal.max_sets``
-        is the number of sets bought; a hedged set pays $1 at resolution.
+        ``cost_usd`` is the cash actually spent. ``fills`` carries the real
+        per-leg outcome as ``(token_id, outcome_name, shares, avg_price)`` or
+        ``(token_id, outcome_name, shares, avg_price, condition_id)``; when
+        omitted the signal's planned legs are assumed to have filled in full,
+        which keeps the ledger honest for callers that do not trade live.
         """
         cost_usd = Decimal(str(cost_usd))
         with self._lock:
             if cost_usd > self.cash:
                 raise ValueError(f"insufficient cash: need {cost_usd}, have {self.cash}")
             self.cash -= cost_usd
+
+            if fills:
+                legs = tuple(
+                    PositionLeg(
+                        str(f[0]),
+                        str(f[1]),
+                        Decimal(str(f[2])),
+                        Decimal(str(f[3])),
+                        str(f[4]) if len(f) > 4 else "",
+                    )
+                    for f in fills
+                    if Decimal(str(f[2])) > 0
+                )
+                held_shares = sum((leg.shares for leg in legs), ZERO)
+            else:
+                legs = tuple(
+                    PositionLeg(leg.token_id, leg.outcome_name, leg.shares, leg.price)
+                    for leg in signal.legs
+                )
+                held_shares = signal.max_sets
+
+            # Payout is based on shares actually held, not the planned size: a
+            # partial fill must not be valued as if the whole order went through.
+            # A hedged set pays $1 per complete set; a directional position
+            # carries its assumed exit price instead.
+            directional = bool(signal.metadata.get("directional", False))
+            if directional:
+                payout = held_shares * signal.payout_per_set
+            else:
+                payout = min((leg.shares for leg in legs), default=held_shares)
             position = Position(
                 signal_kind=signal.kind,
                 group_id=signal.group_id,
                 title=signal.title,
-                token_ids=signal.token_ids,
-                shares=signal.max_sets,
+                token_ids=tuple(leg.token_id for leg in legs),
+                shares=held_shares,
                 cost_usd=cost_usd,
                 opened_at=time.time(),
                 edge_per_set=signal.edge_per_set,
-                expected_payout_usd=signal.max_sets * signal.payout_per_set,
-                hedged=not signal.metadata.get("directional", False),
+                expected_payout_usd=payout,
+                hedged=not directional,
+                legs=legs,
+                condition_id=condition_id,
+                theme=theme,
+                tick_size=tick_size,
+                neg_risk=neg_risk,
             )
             self.positions.append(position)
             self.history.append(
@@ -131,6 +246,7 @@ class Portfolio:
                     "kind": signal.kind,
                     "title": signal.title,
                     "group_id": signal.group_id,
+                    "theme": theme,
                     "shares": str(position.shares),
                     "cost_usd": str(cost_usd),
                     "edge_per_set": str(signal.edge_per_set),
@@ -154,6 +270,8 @@ class Portfolio:
                     "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
                     "kind": position.signal_kind,
                     "title": position.title,
+                    "group_id": position.group_id,
+                    "theme": position.theme,
                     "proceeds_usd": str(proceeds),
                     "cost_usd": str(position.cost_usd),
                     "pnl_usd": str(pnl),
@@ -183,9 +301,25 @@ class Portfolio:
         payload = {
             "snapshot": self.snapshot(),
             "positions": [
-                {**asdict(p), "shares": str(p.shares), "cost_usd": str(p.cost_usd),
-                 "edge_per_set": str(p.edge_per_set), "expected_payout_usd": str(p.expected_payout_usd),
-                 "token_ids": list(p.token_ids)}
+                {
+                    **asdict(p),
+                    "shares": str(p.shares),
+                    "cost_usd": str(p.cost_usd),
+                    "edge_per_set": str(p.edge_per_set),
+                    "expected_payout_usd": str(p.expected_payout_usd),
+                    "tick_size": str(p.tick_size),
+                    "token_ids": list(p.token_ids),
+                    "legs": [
+                        {
+                            "token_id": leg.token_id,
+                            "outcome_name": leg.outcome_name,
+                            "shares": str(leg.shares),
+                            "entry_price": str(leg.entry_price),
+                            "condition_id": leg.condition_id,
+                        }
+                        for leg in p.legs
+                    ],
+                }
                 for p in self.positions
             ],
             "history": self.history[-500:],

@@ -72,6 +72,7 @@ class RiskManager:
         available_cash: Decimal,
         open_exposure: Decimal,
         open_positions: int = 0,
+        theme_exposure: Decimal = ZERO,
     ) -> RiskDecision:
         """Return the approved order notional for a signal, or a rejection."""
         if self.kill_switch:
@@ -86,6 +87,19 @@ class RiskManager:
         if exposure_headroom <= 0:
             return RiskDecision(False, reason="total exposure limit reached")
 
+        # Correlated markets (several "Iran by September" questions) are one
+        # bet, not several, so they share a tighter budget than the portfolio
+        # as a whole. Signals with no resolved theme are not capped here; the
+        # total-exposure limit already bounds them.
+        theme_cap = Decimal(str(self.config.max_theme_exposure_usd))
+        theme = signal.metadata.get("theme") or ""
+        if theme_cap > 0 and theme:
+            theme_headroom = theme_cap - theme_exposure
+            if theme_headroom <= 0:
+                return RiskDecision(False, reason=f"theme exposure limit reached ({theme})")
+        else:
+            theme_headroom = exposure_headroom
+
         cash_headroom = available_cash - Decimal(str(self.config.min_free_balance_usd))
         if cash_headroom <= 0:
             return RiskDecision(False, reason="insufficient free balance")
@@ -97,7 +111,7 @@ class RiskManager:
         fee_per_set = self._fee_per_set(signal, fee)
         all_in_per_set = cost_per_set + fee_per_set
 
-        budget = min(per_order, exposure_headroom, cash_headroom)
+        budget = min(per_order, exposure_headroom, cash_headroom, theme_headroom)
         sets = quantize_down(budget / all_in_per_set, ONE)
         sets = min(sets, signal.max_sets)
         sets = self._apply_book_impact_cap(signal, sets)

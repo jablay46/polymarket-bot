@@ -81,6 +81,16 @@ class Config:
     fade_reversion_alpha: float = 0.10
     fade_min_edge: float = 0.01
 
+    # ---- Exits --------------------------------------------------------------
+    # Sell once the net liquidation value clears entry cost by this fraction.
+    take_profit_pct: float = 0.15
+    # Sell once the net liquidation value falls this fraction below entry cost.
+    stop_loss_pct: float = 0.30
+    exits_enabled: bool = True
+    # Cap exposure across positions sharing a correlation theme (for example
+    # several "Iran by September" markets). 0 disables the check.
+    max_theme_exposure_usd: float = 150.0
+
     # ---- Risk management ----------------------------------------------------
     max_order_usd: float = 100.0
     max_total_exposure_usd: float = 500.0
@@ -162,6 +172,10 @@ class Config:
             fade_min_top_size=get_float("POLYMARKET_BOT_FADE_MIN_TOP_SIZE", 250.0),
             fade_reversion_alpha=get_float("POLYMARKET_BOT_FADE_REVERSION_ALPHA", 0.10),
             fade_min_edge=get_float("POLYMARKET_BOT_FADE_MIN_EDGE", 0.01),
+            take_profit_pct=get_float("POLYMARKET_BOT_TAKE_PROFIT_PCT", 0.15),
+            stop_loss_pct=get_float("POLYMARKET_BOT_STOP_LOSS_PCT", 0.30),
+            exits_enabled=get_bool("POLYMARKET_BOT_EXITS_ENABLED", True),
+            max_theme_exposure_usd=get_float("POLYMARKET_BOT_MAX_THEME_EXPOSURE_USD", 150.0),
             max_order_usd=get_float("POLYMARKET_BOT_MAX_ORDER_USD", 100.0),
             max_total_exposure_usd=get_float("POLYMARKET_BOT_MAX_TOTAL_EXPOSURE_USD", 500.0),
             max_open_positions=get_int("POLYMARKET_BOT_MAX_OPEN_POSITIONS", 8),
@@ -224,6 +238,12 @@ class Config:
             raise ConfigError("max_orders_per_minute must be >= 1")
         if self.poll_interval_seconds < 1:
             raise ConfigError("poll_interval_seconds must be >= 1")
+        if self.take_profit_pct < 0:
+            raise ConfigError("take_profit_pct must be non-negative")
+        if self.stop_loss_pct < 0:
+            raise ConfigError("stop_loss_pct must be non-negative")
+        if self.max_theme_exposure_usd < 0:
+            raise ConfigError("max_theme_exposure_usd must be non-negative")
 
     # --------------------------------------------------------------- helpers
     @property

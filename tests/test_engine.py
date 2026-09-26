@@ -163,8 +163,39 @@ def test_anti_chase_allows_a_stable_price():
     engine.execution = ExecutionEngine(config, engine.broker, engine.portfolio)
     engine.run_cycle()
     engine._cooldowns.clear()
+    # Close the position so the duplicate guard is not what decides this;
+    # a stable price must pass the anti-chase check and re-enter cleanly.
+    for position in list(engine.portfolio.positions):
+        engine.portfolio.close_position(position, position.cost_usd)
     second = engine.run_cycle()
     assert second.orders_filled == 1
+
+
+def test_cycle_never_doubles_up_on_a_market_it_already_holds():
+    """The cooldown is a timer; holding the market must block re-entry forever."""
+    engine = build_engine([arb_group()])
+    first = engine.run_cycle()
+    assert first.orders_filled == 1
+
+    # Clear the cooldown so only the held-position guard can prevent a re-buy.
+    engine._cooldowns.clear()
+    second = engine.run_cycle()
+    assert second.signals_found >= 1
+    assert second.orders_filled == 0
+    assert second.signals_rejected >= 1
+    assert engine.portfolio.open_positions == 1
+
+
+def test_cycle_reenters_after_the_position_is_closed():
+    """Closing a position must free the market for a fresh entry."""
+    engine = build_engine([arb_group()])
+    engine.run_cycle()
+    position = engine.portfolio.positions[0]
+    engine.portfolio.close_position(position, position.cost_usd)
+    engine._cooldowns.clear()
+    stats = engine.run_cycle()
+    assert stats.orders_filled == 1
+    assert engine.portfolio.open_positions == 1
 
 
 def test_run_forever_stops_after_max_cycles():

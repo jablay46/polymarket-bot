@@ -83,6 +83,32 @@ directional=$50.00 (assumed_profit=$310.00)
 `hedged_profit` is money you have locked in. `assumed_profit` is a
 model output that may never happen. Only the first is real.
 
+## Closing positions
+
+Positions do not sit until the market dies. Every cycle, before it looks for
+new trades, the bot works its open positions:
+
+| Path | Trigger | Result |
+| --- | --- | --- |
+| Take profit | Net sale value clears entry cost by `TAKE_PROFIT_PCT` | Sells into the bids |
+| Stop loss | Net sale value falls `STOP_LOSS_PCT` below entry cost | Cuts the loss |
+| Settlement | Market resolved | Pays $1 per winning share, no order needed |
+
+Two properties keep this honest:
+
+* **Exits are priced against the live book.** The quoted profit is what the
+  resting bids would actually pay for the whole size, net of taker fees. If the
+  book is too thin to absorb the position, the exit is skipped and retried
+  later, because a paper profit nobody will buy is not a profit.
+* **A hedged set exits all-or-nothing.** Selling one leg of a pair would leave
+  naked directional risk, so every leg must be fully sellable or nothing is
+  sold. Directional (fade) positions exit leg by leg, since there is no hedge
+  to break.
+
+A market can only be bought once. The per-market cooldown is just a timer and
+will always expire, so a separate guard refuses any entry while a position on
+that market is still open. Closing a position frees the market again.
+
 ## Commands
 
 | Command | What it does |
@@ -124,6 +150,9 @@ The ones that matter most:
 | `POLYMARKET_BOT_MAX_TOTAL_EXPOSURE_USD` | `500` | Total capital at risk |
 | `POLYMARKET_BOT_MAX_OPEN_POSITIONS` | `8` | Concurrent positions |
 | `POLYMARKET_BOT_MIN_FREE_BALANCE_USD` | `20` | Cash kept in reserve |
+| `POLYMARKET_BOT_TAKE_PROFIT_PCT` | `0.15` | Profit at which a position is sold |
+| `POLYMARKET_BOT_STOP_LOSS_PCT` | `0.30` | Loss at which a position is cut |
+| `POLYMARKET_BOT_MAX_THEME_EXPOSURE_USD` | `150` | Cap shared by correlated markets |
 | `POLYMARKET_BOT_KILL_SWITCH` | `false` | Detect but never trade |
 
 ## Going live
@@ -160,6 +189,12 @@ These are enforced in code, not by convention:
   immediately unwinds the filled leg instead of holding a naked position.
 - **Anti-chase.** A market whose price spiked since the last scan is
   skipped, so the bot does not buy into a moving quote.
+- **One position per market.** A held market is refused outright, so the
+  bot can never average into a bet it already owns.
+- **Correlation cap.** Markets sharing a story (several Iran questions) draw
+  from one shared budget instead of stacking the same bet.
+- **Bounded downside.** A stop loss cuts directional bets that go wrong, and
+  every exit is validated against the live book before it is sent.
 - **Fee realism.** Fees come from the venue per market, with an optional
   safety multiplier, and are subtracted before any edge is reported.
 
@@ -173,11 +208,12 @@ polymarket_bot/
   strategies.py   the three strategies
   risk.py         sizing, exposure, rate limits, kill switch
   execution.py    leg ordering and failure unwind
+  exits.py        take profit, stop loss, settlement
   brokers.py      paper and live order placement
   portfolio.py    cash ledger and positions
   engine.py       the scan/decide/execute loop
   cli.py          command line interface
-tests/            113 tests, no network
+tests/            134 tests, no network
 ```
 
 ## Tests
