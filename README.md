@@ -71,6 +71,40 @@ separately from locked-in arbitrage profit so the two can never be confused.
 
 Leave it off unless you have your own reason to believe the reversion.
 
+### 4. Cross-market threshold ladders (signal-only, never auto-executed)
+
+Some questions form a numeric ladder on one subject and window — "Will BTC be
+above $90k by Dec 31?" and "Will BTC be above $100k by Dec 31?". Above the
+higher threshold implies above the lower, so the two are not independent, and
+when the market prices them out of order the safe side pays $1 in every state
+the relation allows.
+
+This is the one strategy here whose edge rests on a *relation the code guessed
+at*, not on something the CLOB guarantees. A binary market's Yes+No partition
+$1 by construction; a neg-risk event's outcomes are mutually exclusive by
+protocol. A ladder relation is inferred from the question text, and the text
+cannot distinguish "BTC above $90k, Binance spot" from "BTC above $90k,
+Coinbase spot" — questions that look identical to the parser but are not the
+same claim. When the relation does not actually hold, the "arbitrage" is a
+directional bet wearing an arbitrage label, so every relation needs a human to
+confirm the resolution rules before it is traded.
+
+Accordingly this strategy only emits signals. It is not wired into
+`run_cycle`, its signals carry `metadata["unverified_relation"] = True`, and
+its confidence is zero so it cannot outrank the verified strategies. Wiring it
+to execution is a deliberate decision for whoever reviews it.
+
+Two details that are easy to get wrong, and are load-bearing:
+
+* **Which two legs.** On an "above" ladder the implication is
+  `above(high) => above(low)`, so the safe side is **Yes(low) + No(high)**. A
+  "below" ladder implies the other way and needs the mirror pair,
+  **Yes(high) + No(low)**. The two are not interchangeable; picking the wrong
+  one turns a covered position into a bet against the middle of the range.
+* **Direction is part of the group key.** "Above $90k" and "below $100k" on
+  one subject are not ordered against each other, so grouping them would price
+  noise as edge.
+
 ## How the money is tracked
 
 The paper ledger separates two very different numbers:
@@ -217,7 +251,7 @@ polymarket_bot/
   portfolio.py    cash ledger and positions
   engine.py       the scan/decide/execute loop
   cli.py          command line interface
-tests/            138 tests, no network
+tests/            156 tests, no network
 ```
 
 ## Tests
