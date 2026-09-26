@@ -408,32 +408,43 @@ class StrategyEngine:
 
     def evaluate(self, group: MarketGroup, fee: FeeModel) -> list[Signal]:
         signals: list[Signal] = []
-        if not self._passes_common_filters(group):
-            return signals
-        if self.config.arb_enabled:
+        if self.config.arb_enabled and self._passes_filters(group, "arb"):
             signal = self.set_arbitrage.evaluate(group, fee)
             if signal is not None:
                 signals.append(signal)
-        if self.config.basket_enabled:
+        if self.config.basket_enabled and self._passes_filters(group, "basket"):
             signal = self.basket_arbitrage.evaluate(group, fee)
             if signal is not None:
                 signals.append(signal)
-        if self.config.fade_enabled:
+        if self.config.fade_enabled and self._passes_filters(group, "fade"):
             signal = self.fade.evaluate(group, fee)
             if signal is not None:
                 signals.append(signal)
         return signals
 
-    def _passes_common_filters(self, group: MarketGroup) -> bool:
-        seconds = group.seconds_to_end
-        if group.is_binary:
-            low, high = self.config.arb_min_seconds_left, self.config.arb_max_seconds_left
-            min_vol = self.config.arb_min_volume_24h
+    def _passes_filters(self, group: MarketGroup, kind: str) -> bool:
+        """Apply the liquidity and time filters belonging to one strategy.
+
+        Each strategy has its own thresholds, so the filters must be chosen by
+        the strategy being evaluated rather than by the market's shape. Fade in
+        particular needs far more liquidity than the arbitrage strategies.
+        """
+        if kind == "fade":
+            low = self.config.fade_min_seconds_left
+            high = self.config.arb_max_seconds_left
+            min_vol = self.config.fade_min_volume_24h
             min_liq = self.config.arb_min_liquidity
-        else:
-            low, high = self.config.basket_min_seconds_left, self.config.arb_max_seconds_left
+        elif kind == "basket":
+            low = self.config.basket_min_seconds_left
+            high = self.config.arb_max_seconds_left
             min_vol = self.config.basket_min_volume_24h
             min_liq = self.config.basket_min_liquidity
+        else:
+            low = self.config.arb_min_seconds_left
+            high = self.config.arb_max_seconds_left
+            min_vol = self.config.arb_min_volume_24h
+            min_liq = self.config.arb_min_liquidity
+        seconds = group.seconds_to_end
         if seconds is not None and (seconds < low or seconds > high):
             return False
         if group.volume_24h < Decimal(str(min_vol)):

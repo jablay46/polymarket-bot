@@ -306,3 +306,49 @@ def test_engine_returns_both_arbitrage_signals_when_applicable():
     engine = StrategyEngine(make_config())
     signals = engine.evaluate(group, FEE_FREE)
     assert [s.kind for s in signals] == ["set_arbitrage"]
+
+
+def test_fade_uses_its_own_liquidity_filter_not_the_arb_one():
+    """Fade demands far more liquidity than the arbitrage strategies.
+
+    Regression: the engine used to pick filters by market shape, so a binary
+    market routed fade through the *arb* thresholds and a thin book could pass.
+    """
+    thin = binary_group(
+        yes_asks=[("0.02", "5000")], yes_bids=[("0.015", "5000")],
+        no_asks=[("0.98", "5000")], no_bids=[("0.975", "5000")],
+        volume_24h=Decimal("10000"), liquidity=Decimal("5000"),
+    )
+    engine = StrategyEngine(
+        make_config(
+            arb_enabled=False,
+            basket_enabled=False,
+            fade_enabled=True,
+            arb_min_volume_24h=1000.0,   # permissive: would wrongly let fade through
+            arb_min_liquidity=1000.0,
+            fade_min_volume_24h=50000.0,  # strict: this is the one that must apply
+        )
+    )
+    assert engine.evaluate(thin, FEE_FREE) == []
+
+
+def test_fade_passes_its_own_filters_on_a_liquid_market():
+    liquid = binary_group(
+        yes_asks=[("0.02", "5000")], yes_bids=[("0.015", "5000")],
+        no_asks=[("0.98", "5000")], no_bids=[("0.975", "5000")],
+        volume_24h=Decimal("100000"), liquidity=Decimal("50000"),
+    )
+    engine = StrategyEngine(
+        make_config(arb_enabled=False, basket_enabled=False, fade_enabled=True)
+    )
+    signals = engine.evaluate(liquid, FEE_FREE)
+    assert [s.kind for s in signals] == ["fade_extreme"]
+
+
+def test_disabled_strategies_do_not_emit_signals():
+    group = binary_group(
+        yes_asks=[("0.45", "500")], yes_bids=[("0.44", "500")],
+        no_asks=[("0.50", "500")], no_bids=[("0.49", "500")],
+    )
+    engine = StrategyEngine(make_config(arb_enabled=False, basket_enabled=False))
+    assert engine.evaluate(group, FEE_FREE) == []

@@ -7,7 +7,7 @@ depth, and executes through a broker you can swap between paper and live.
 - **No dependencies for paper mode.** Standard library only.
 - **Arbitrage first.** Two risk-free strategies enabled by default.
 - **Honest numbers.** Fees, slippage, and book depth are modelled per leg.
-- **110 tests**, no network required to run them.
+- **113 tests**, no network required to run them.
 
 ```
 $ python run.py doctor
@@ -177,7 +177,7 @@ polymarket_bot/
   portfolio.py    cash ledger and positions
   engine.py       the scan/decide/execute loop
   cli.py          command line interface
-tests/            110 tests, no network
+tests/            113 tests, no network
 ```
 
 ## Tests

@@ -56,7 +56,6 @@ class Config:
     arb_min_top_size: float = 100.0
     arb_cooldown_seconds: int = 60
     arb_antichase_spike: float = 0.08
-    arb_require_fee_free: bool = False
 
     # ---- Basket arbitrage (neg-risk outcome sets) ---------------------------
     basket_enabled: bool = True
