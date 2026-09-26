@@ -40,6 +40,7 @@ class CycleStats:
     notional_usd: Decimal = ZERO
     exits: int = 0
     stop_losses: int = 0
+    partial_exits: int = 0
     settled: int = 0
     realized_usd: Decimal = ZERO
 
@@ -55,6 +56,7 @@ class CycleStats:
             "notional": float(self.notional_usd),
             "exits": self.exits,
             "stopped": self.stop_losses,
+            "partial_exits": self.partial_exits,
             "settled": self.settled,
         }
 
@@ -372,7 +374,11 @@ class TradingEngine:
                 stats.exits += 1
                 if decision.reason == "stop_loss":
                     stats.stop_losses += 1
-                stats.realized_usd += decision.pnl_usd
+                # Book what the fills actually returned, not the pre-trade
+                # estimate: a partly filled exit realizes less than planned.
+                stats.realized_usd += self.exits.last_pnl
+                if self.exits.last_remaining > 0:
+                    stats.partial_exits += 1
             else:
                 stats.errors += 1
 

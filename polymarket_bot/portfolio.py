@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import threading
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from decimal import Decimal
 from pathlib import Path
 
@@ -60,6 +60,7 @@ class Position:
     theme: str = ""
     tick_size: Decimal = Decimal("0.01")
     neg_risk: bool = False
+    payout_per_set: Decimal = ONE
 
     @property
     def expected_profit_usd(self) -> Decimal:
@@ -237,6 +238,7 @@ class Portfolio:
                 theme=theme,
                 tick_size=tick_size,
                 neg_risk=neg_risk,
+                payout_per_set=signal.payout_per_set,
             )
             self.positions.append(position)
             self.history.append(
@@ -280,6 +282,89 @@ class Portfolio:
             )
             return pnl
 
+    def reduce_position(
+        self,
+        position: Position,
+        sold_shares: dict[str, Decimal],
+        proceeds_usd: Decimal,
+        reason: str = "partial",
+    ) -> tuple[Decimal, Decimal]:
+        """Book an exit for the shares that actually sold.
+
+        Returns ``(pnl, remaining_shares)``. Whatever did not sell stays on the
+        ledger: a position whose exit was only partly filled still carries real
+        risk, so dropping it from ``positions`` would understate open exposure
+        and let the bot open new trades against risk it already holds. The
+        position is only removed once every share is gone.
+        """
+        with self._lock:
+            proceeds = Decimal(str(proceeds_usd))
+            sold_cost = ZERO
+            remaining_legs: list[PositionLeg] = []
+            sold_total = ZERO
+            for leg in position.legs:
+                sold = min(Decimal(str(sold_shares.get(leg.token_id, ZERO))), leg.shares)
+                sold_total += sold
+                sold_cost += sold * leg.entry_price
+                left = leg.shares - sold
+                if left > 0:
+                    remaining_legs.append(replace(leg, shares=left))
+
+            self.cash += proceeds
+            pnl = proceeds - sold_cost
+            self.realized_pnl += pnl
+            remaining_shares = sum((leg.shares for leg in remaining_legs), ZERO)
+
+            if remaining_legs:
+                # Revalue what is left so exposure and payout track reality.
+                hedge_intact = position.hedged and len(remaining_legs) == len(position.legs)
+                if hedge_intact:
+                    payout = min((leg.shares for leg in remaining_legs), default=ZERO) * position.payout_per_set
+                elif position.hedged:
+                    # A leg sold out entirely, so the hedge is broken and the
+                    # leftover is naked. Value it at cost rather than claiming
+                    # a guaranteed payout it no longer has.
+                    left_cost = sum((leg.cost_usd for leg in remaining_legs), ZERO)
+                    payout = left_cost
+                else:
+                    payout = remaining_shares * position.payout_per_set
+                reduced = replace(
+                    position,
+                    legs=tuple(remaining_legs),
+                    token_ids=tuple(leg.token_id for leg in remaining_legs),
+                    shares=remaining_shares,
+                    cost_usd=position.cost_usd - sold_cost,
+                    expected_payout_usd=payout,
+                    hedged=hedge_intact,
+                )
+                for i, held in enumerate(self.positions):
+                    if held is position:
+                        self.positions[i] = reduced
+                        break
+            else:
+                for i, held in enumerate(self.positions):
+                    if held is position:
+                        del self.positions[i]
+                        break
+
+            self.history.append(
+                {
+                    "event": "close" if not remaining_legs else "reduce",
+                    "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "kind": position.signal_kind,
+                    "title": position.title,
+                    "group_id": position.group_id,
+                    "theme": position.theme,
+                    "proceeds_usd": str(proceeds),
+                    "sold_shares": str(sold_total),
+                    "remaining_shares": str(remaining_shares),
+                    "cost_usd": str(sold_cost),
+                    "pnl_usd": str(pnl),
+                    "reason": reason,
+                }
+            )
+            return pnl, remaining_shares
+
     # ------------------------------------------------------------ persistence
     def snapshot(self) -> dict:
         return {
@@ -308,6 +393,7 @@ class Portfolio:
                     "edge_per_set": str(p.edge_per_set),
                     "expected_payout_usd": str(p.expected_payout_usd),
                     "tick_size": str(p.tick_size),
+                    "payout_per_set": str(p.payout_per_set),
                     "token_ids": list(p.token_ids),
                     "legs": [
                         {

@@ -17,6 +17,11 @@ absorb the size. Exits are therefore all-or-nothing per position: for a hedged
 set, every leg must be fully executable, otherwise selling one leg alone would
 break the hedge and leave naked directional risk. When the book is too thin the
 position is simply held.
+
+If an exit only partly fills — one leg fails, or a leg fills short — the shares
+that did sell are booked and **the rest stay on the ledger**. Dropping the whole
+position there would hide risk the bot still holds, understate open exposure,
+and let it open new trades against headroom it does not have.
 """
 
 from __future__ import annotations
@@ -81,6 +86,10 @@ class ExitEngine:
         self.exits_taken = 0
         self.stops_taken = 0
         self.settlements = 0
+        # Filled by close(): the PnL actually booked, and any shares left on the
+        # ledger when an exit only partly filled.
+        self.last_pnl: Decimal = ZERO
+        self.last_remaining: Decimal = ZERO
 
     # ------------------------------------------------------------- valuation
     def liquidate(self, position: Position, group: MarketGroup, fee: FeeModel) -> Liquidation:
@@ -159,6 +168,7 @@ class ExitEngine:
         neg_risk = group.neg_risk
         sets = position.guaranteed_sets
         proceeds = ZERO
+        sold: dict[str, Decimal] = {}
         all_ok = True
 
         for leg in position.legs:
@@ -177,28 +187,47 @@ class ExitEngine:
                 neg_risk=neg_risk,
                 order_type=self.config.live_order_type,
             )
-            if result.ok:
+            if result.ok and result.filled_shares > 0:
+                sold[leg.token_id] = sold.get(leg.token_id, ZERO) + result.filled_shares
                 proceeds += result.filled_usd
+                if result.filled_shares < sell_shares:
+                    all_ok = False
+                    log.warning(
+                        "exit leg partly filled for %s (%s): %s/%s shares",
+                        position.title[:40],
+                        leg.outcome_name,
+                        result.filled_shares,
+                        sell_shares,
+                    )
+                    break
             else:
                 all_ok = False
                 log.warning("exit leg failed for %s: %s", position.title[:40], result.error)
                 break
 
-        if not all_ok:
-            # A partial exit on a hedged set leaves naked risk, so this is
-            # surfaced loudly rather than silently swallowed.
-            log.error(
-                "EXIT INCOMPLETE for %s — position may be partially closed, manual review required",
-                position.title[:60],
-            )
-            if proceeds <= 0:
-                return False
+        if not sold:
+            return False
 
-        self.portfolio.close_position(position, proceeds, reason=decision.reason)
+        pnl, remaining = self.portfolio.reduce_position(
+            position, sold, proceeds, reason=decision.reason
+        )
+
+        if not all_ok:
+            # Whatever did not sell is still on the ledger. For a hedged set
+            # that means the hedge is broken and the leftover is naked risk,
+            # which is worth shouting about rather than rounding away.
+            log.error(
+                "EXIT INCOMPLETE for %s — %.2f shares still held at risk, manual review required",
+                position.title[:60],
+                remaining,
+            )
+
         if decision.reason == "stop_loss":
             self.stops_taken += 1
         else:
             self.exits_taken += 1
+        self.last_pnl = pnl
+        self.last_remaining = remaining
         return True
 
     @staticmethod

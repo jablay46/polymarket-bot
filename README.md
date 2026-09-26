@@ -104,6 +104,10 @@ Two properties keep this honest:
   naked directional risk, so every leg must be fully sellable or nothing is
   sold. Directional (fade) positions exit leg by leg, since there is no hedge
   to break.
+* **A partial exit keeps the remainder on the books.** If a leg fails or fills
+  short, the shares that sold are booked and the rest stay open, with their
+  cost basis intact. Deleting the position there would hide risk the bot still
+  holds and overstate the exposure headroom available for new trades.
 
 A market can only be bought once. The per-market cooldown is just a timer and
 will always expire, so a separate guard refuses any entry while a position on
@@ -213,7 +217,7 @@ polymarket_bot/
   portfolio.py    cash ledger and positions
   engine.py       the scan/decide/execute loop
   cli.py          command line interface
-tests/            134 tests, no network
+tests/            138 tests, no network
 ```
 
 ## Tests

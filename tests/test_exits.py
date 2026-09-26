@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from polymarket_bot.brokers import PaperBroker
+from polymarket_bot.brokers import LegResult, PaperBroker
 from polymarket_bot.config import Config
 from polymarket_bot.exits import ExitEngine
 from polymarket_bot.fees import FeeModel
@@ -380,3 +380,130 @@ def test_save_serializes_leg_detail(tmp_path):
     text = target.read_text()
     assert "entry_price" in text
     assert "condition_id" in text
+
+
+# ---------------------------------------------------- partial exit accounting
+
+
+class OneLegFailsBroker(PaperBroker):
+    """Sells the first leg, then fails the second, as a thin book would."""
+
+    def __init__(self, config, fail_token="tok-1"):
+        super().__init__(config)
+        self.fail_token = fail_token
+
+    def sell(self, *, token_id, shares, price, tick_size=Decimal("0.01"), neg_risk=False, order_type="FAK"):
+        if token_id == self.fail_token:
+            return LegResult(token_id, "SELL", False, error="book too thin")
+        return super().sell(
+            token_id=token_id,
+            shares=shares,
+            price=price,
+            tick_size=tick_size,
+            neg_risk=neg_risk,
+            order_type=order_type,
+        )
+
+
+class HalfFillBroker(PaperBroker):
+    """Fills only half of every sell, as a partly consumed book would."""
+
+    def sell(self, *, token_id, shares, price, tick_size=Decimal("0.01"), neg_risk=False, order_type="FAK"):
+        half = (shares / 2).quantize(Decimal("0.01"))
+        result = super().sell(
+            token_id=token_id,
+            shares=half,
+            price=price,
+            tick_size=tick_size,
+            neg_risk=neg_risk,
+            order_type=order_type,
+        )
+        return result
+
+
+def test_failed_second_leg_keeps_the_unsold_position_on_the_ledger():
+    """A half-done exit must not delete the position.
+
+    Selling one leg of a hedged pair and dropping the position from the ledger
+    would hide the leg still held, understate open exposure, and let the bot
+    open new trades against risk it already carries.
+    """
+    config = make_config(take_profit_pct=0.05)
+    portfolio = Portfolio(Decimal("1000"))
+    broker = OneLegFailsBroker(config)
+    engine = ExitEngine(config, broker, portfolio)
+    position = open_set(portfolio)
+
+    decision = engine.evaluate(position, group(yes_bid="0.60", no_bid="0.45"), FEE_FREE)
+    assert decision.should_exit
+
+    assert engine.close(position, group(yes_bid="0.60", no_bid="0.45"), decision)
+
+    # The unsold leg is still on the books.
+    assert portfolio.open_positions == 1
+    held = portfolio.positions[0]
+    assert held.token_ids == ("tok-1",)
+    assert held.shares == Decimal("100")
+
+    # Exposure still reflects the leg at risk, so headroom is not overstated.
+    assert portfolio.open_exposure == Decimal("47.50")
+    # Only the leg that sold was realized: 100 * 0.60 - 100 * 0.475 = 12.50.
+    assert portfolio.realized_pnl == Decimal("12.50")
+    assert engine.last_remaining == Decimal("100")
+
+
+def test_partial_fill_keeps_the_remainder_and_books_only_what_sold():
+    """A half-filled leg stops the exit and leaves the rest on the ledger.
+
+    Selling the other leg after a partial fill would break the hedge and leave
+    a naked position, so the exit halts and only the filled part is booked.
+    """
+    config = make_config(take_profit_pct=0.05)
+    portfolio = Portfolio(Decimal("1000"))
+    broker = HalfFillBroker(config)
+    engine = ExitEngine(config, broker, portfolio)
+    position = open_set(portfolio)
+
+    decision = engine.evaluate(position, group(yes_bid="0.60", no_bid="0.45"), FEE_FREE)
+    assert engine.close(position, group(yes_bid="0.60", no_bid="0.45"), decision)
+
+    assert portfolio.open_positions == 1
+    held = portfolio.positions[0]
+    # 50 of leg 0 sold; 50 of leg 0 and all 100 of leg 1 remain.
+    assert held.token_ids == ("tok-0", "tok-1")
+    assert held.shares == Decimal("150.00")
+    assert held.guaranteed_sets == Decimal("50")
+    # Only the sold half left the cost basis.
+    assert held.cost_usd == Decimal("71.25")
+    assert portfolio.open_exposure == Decimal("71.25")
+    assert engine.last_remaining == Decimal("150.00")
+
+
+def test_reduce_position_removes_the_position_once_fully_sold():
+    portfolio = Portfolio(Decimal("1000"))
+    position = open_set(portfolio)
+    pnl, remaining = portfolio.reduce_position(
+        position,
+        {"tok-0": Decimal("100"), "tok-1": Decimal("100")},
+        Decimal("105"),
+        reason="take_profit",
+    )
+    assert portfolio.open_positions == 0
+    assert remaining == 0
+    assert pnl == Decimal("10.00")
+    assert portfolio.realized_pnl == Decimal("10.00")
+
+
+def test_reduce_position_marks_a_broken_hedge_as_directional():
+    """Once a leg is gone the leftover is naked, not a guaranteed set."""
+    portfolio = Portfolio(Decimal("1000"))
+    position = open_set(portfolio)
+    portfolio.reduce_position(
+        position,
+        {"tok-0": Decimal("100")},
+        Decimal("60"),
+        reason="take_profit",
+    )
+    held = portfolio.positions[0]
+    assert not held.hedged
+    assert portfolio.directional_exposure == Decimal("47.50")
