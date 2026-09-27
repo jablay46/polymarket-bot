@@ -507,3 +507,36 @@ def test_reduce_position_marks_a_broken_hedge_as_directional():
     held = portfolio.positions[0]
     assert not held.hedged
     assert portfolio.directional_exposure == Decimal("47.50")
+
+
+# ------------------------------------------------------- exit fee accounting
+
+
+def test_close_books_proceeds_net_of_the_same_fees_it_decided_on():
+    """The booked PnL must equal the decision's PnL, fees included.
+
+    The decision walks the bids and subtracts the exit fee; the close used to
+    book the gross fill, so the STOP-LOSS line printed one number and the
+    portfolio's realized PnL grew by a different one.
+    """
+    config = make_config(stop_loss_pct=0.30)
+    portfolio = Portfolio(Decimal("1000"))
+    broker = PaperBroker(config)
+    engine = ExitEngine(config, broker, portfolio)
+    fee = FeeModel.for_market(fees_enabled=True, fee_type="politics_fees")
+    position = open_set(portfolio)  # cost 95.00
+
+    group_ = group(yes_bid="0.30", no_bid="0.20")
+    decision = engine.evaluate(position, group_, fee)
+    assert decision.should_exit
+    assert engine.close(position, group_, decision, fee)
+    assert engine.last_pnl == decision.pnl_usd
+    assert portfolio.realized_pnl == decision.pnl_usd
+
+
+def test_close_without_a_fee_model_still_works_for_fee_free_callers():
+    engine, portfolio, _ = build_exits(take_profit_pct=0.05)
+    position = open_set(portfolio)
+    decision = engine.evaluate(position, group(yes_bid="0.60", no_bid="0.45"), FEE_FREE)
+    assert engine.close(position, group(yes_bid="0.60", no_bid="0.45"), decision)
+    assert portfolio.realized_pnl == Decimal("10.00")

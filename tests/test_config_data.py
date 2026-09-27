@@ -64,6 +64,9 @@ def test_defaults_apply_without_env(monkeypatch):
     assert config.basket_enabled is True
     assert config.fade_enabled is False
     assert config.kill_switch is False
+    # The churn guard is on by default: a stopped market is not re-bought.
+    assert config.reentry_cooldown_seconds == 900
+    assert config.fade_max_round_trip_ratio == pytest.approx(0.25)
 
 
 def test_overrides_take_precedence(monkeypatch):
@@ -274,3 +277,21 @@ def test_fetch_binary_markets_deduplicates_across_pages():
     infos = scanner.fetch_binary_markets(limit=200, pages=2)
 
     assert len({i.market_id for i in infos}) == len(infos)
+
+
+def test_scanner_stats_describe_a_single_scan_not_a_running_total():
+    """The "scan complete" counters must reset each scan.
+
+    They used to accumulate forever, so the log line ("N markets") climbed
+    while each cycle actually scanned the same capped number.
+    """
+    scanner = MarketScanner(Config.from_env())
+    scanner.http = PagedHttp(total=250)
+
+    scanner.fetch_binary_markets(limit=100, pages=1)
+    first = scanner.stats.markets_seen
+    assert first == 100
+
+    scanner.stats.reset()
+    scanner.fetch_binary_markets(limit=100, pages=1)
+    assert scanner.stats.markets_seen == 100

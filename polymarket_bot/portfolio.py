@@ -111,6 +111,7 @@ class Portfolio:
     positions: list[Position] = field(default_factory=list)
     history: list[dict] = field(default_factory=list)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _blocked: dict = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
         self.starting_balance = Decimal(str(self.starting_balance))
@@ -165,6 +166,34 @@ class Portfolio:
             return False
         with self._lock:
             return any(p.group_id == group_id for p in self.positions)
+
+    def blocked(self, group_id: str, now: float | None = None) -> bool:
+        """True if this market is on the post-loss blocklist.
+
+        A stopped-out market is not re-entered until its cooldown expires. The
+        exit runs before entry in the same cycle, so without this a position
+        that is stopped would leave the ledger and the strategy would buy the
+        exact same signal again on the next line.
+        """
+        if not group_id:
+            return False
+        now = time.time() if now is None else now
+        with self._lock:
+            until = self._blocked.get(group_id, 0.0)
+            if until <= 0:
+                return False
+            if now >= until:
+                self._blocked.pop(group_id, None)
+                return False
+            return True
+
+    def block_reentry(self, group_id: str, seconds: float, now: float | None = None) -> None:
+        """Put a market on the blocklist for ``seconds`` from now."""
+        if not group_id or seconds <= 0:
+            return
+        now = time.time() if now is None else now
+        with self._lock:
+            self._blocked[group_id] = max(self._blocked.get(group_id, 0.0), now + seconds)
 
     def theme_exposure(self, theme: str) -> Decimal:
         """Open exposure across every position sharing a correlation theme."""
@@ -426,6 +455,11 @@ class Portfolio:
             f"cash=${self.cash:.2f} exposure=${self.open_exposure:.2f} "
             f"equity=${self.equity:.2f} open={self.open_positions} "
             f"realized=${self.realized_pnl:.2f} "
-            f"hedged_profit=${self.expected_profit:.2f} "
-            f"directional=${self.directional_exposure:.2f} (assumed_profit=${self.assumed_profit:.2f})"
+            f"locked_profit=${self.expected_profit:.2f} "
+            f"directional=${self.directional_exposure:.2f} "
+            # Deliberately labelled "assumed", not "profit": this figure is the
+            # strategy's own model saying what it hopes to make, and it can run
+            # many times the capital actually at risk. Printing it as profit
+            # invited exactly the overconfidence it represents.
+            f"(assumed_profit=${self.assumed_profit:.2f} at risk, not locked)"
         )

@@ -100,6 +100,14 @@ class Config:
     # travel. This is the strategy's core (unverifiable) assumption.
     fade_reversion_alpha: float = 0.10
     fade_min_edge: float = 0.01
+    # A fade buys at the ask and can only leave at the bid, so the round-trip
+    # spread plus both fees is a cost the assumed reversion has to clear. Two
+    # gates use it: the assumed move must beat the round-trip cost outright,
+    # and that cost must stay this fraction of the entry price or smaller. The
+    # second gate is what keeps the strategy off 2c markets where a single
+    # unmoved tick is already more than the stop-loss will tolerate, so the
+    # position would be stopped out on the next cycle with the book unmoved.
+    fade_max_round_trip_ratio: float = 0.25
 
     # ---- Exits --------------------------------------------------------------
     # Sell once the net liquidation value clears entry cost by this fraction.
@@ -107,6 +115,12 @@ class Config:
     # Sell once the net liquidation value falls this fraction below entry cost.
     stop_loss_pct: float = 0.30
     exits_enabled: bool = True
+    # After a stop-loss (or a resolved loss) on a market, refuse to re-enter it
+    # for this many seconds. Without it the exit runs before entry in the same
+    # cycle, the position leaves the ledger, and the strategy re-buys the same
+    # market immediately — the churn loop that turned one bad signal into four
+    # repeat losses.
+    reentry_cooldown_seconds: int = 900
     # Cap exposure across positions sharing a correlation theme (for example
     # several "Iran by September" markets). 0 disables the check.
     max_theme_exposure_usd: float = 150.0
@@ -201,9 +215,11 @@ class Config:
             fade_min_top_size=get_float("POLYMARKET_BOT_FADE_MIN_TOP_SIZE", 250.0),
             fade_reversion_alpha=get_float("POLYMARKET_BOT_FADE_REVERSION_ALPHA", 0.10),
             fade_min_edge=get_float("POLYMARKET_BOT_FADE_MIN_EDGE", 0.01),
+            fade_max_round_trip_ratio=get_float("POLYMARKET_BOT_FADE_MAX_ROUND_TRIP_RATIO", 0.25),
             take_profit_pct=get_float("POLYMARKET_BOT_TAKE_PROFIT_PCT", 0.15),
             stop_loss_pct=get_float("POLYMARKET_BOT_STOP_LOSS_PCT", 0.30),
             exits_enabled=get_bool("POLYMARKET_BOT_EXITS_ENABLED", True),
+            reentry_cooldown_seconds=get_int("POLYMARKET_BOT_REENTRY_COOLDOWN_S", 900),
             max_theme_exposure_usd=get_float("POLYMARKET_BOT_MAX_THEME_EXPOSURE_USD", 150.0),
             max_order_usd=get_float("POLYMARKET_BOT_MAX_ORDER_USD", 100.0),
             max_total_exposure_usd=get_float("POLYMARKET_BOT_MAX_TOTAL_EXPOSURE_USD", 500.0),
@@ -247,6 +263,7 @@ class Config:
             ("fade_max_entry", 0.0, 1.0),
             ("fade_reversion_alpha", 0.0, 1.0),
             ("fade_min_edge", 0.0, 1.0),
+            ("fade_max_round_trip_ratio", 0.0, 10.0),
             ("cross_market_min_edge", 0.0, 1.0),
             ("cross_market_max_edge", 0.0, 1.0),
             ("max_book_impact", 0.0, 1.0),
@@ -277,6 +294,8 @@ class Config:
             raise ConfigError("stop_loss_pct must be non-negative")
         if self.max_theme_exposure_usd < 0:
             raise ConfigError("max_theme_exposure_usd must be non-negative")
+        if self.reentry_cooldown_seconds < 0:
+            raise ConfigError("reentry_cooldown_seconds must be non-negative")
         if self.cross_market_scan_pages < 1:
             raise ConfigError("cross_market_scan_pages must be >= 1")
 

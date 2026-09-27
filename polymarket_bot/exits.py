@@ -133,7 +133,19 @@ class ExitEngine:
                            gross_usd=gross, fee_usd=fee_total, net_usd=net)
 
     def evaluate(self, position: Position, group: MarketGroup, fee: FeeModel) -> ExitDecision:
-        """Apply take-profit and stop-loss thresholds to one position."""
+        """Apply take-profit and stop-loss thresholds to one position.
+
+        Both thresholds are measured on the **realizable** value — what selling
+        now would actually return, walking the bids and netting fees. A stop
+        that cannot be filled is not a stop, and a profit the book will not pay
+        is not a profit.
+
+        The **mark** (fair value at each leg's mid) is computed only for the log
+        line. The entry spread is what made an unmoved fade look stopped out on
+        the next cycle, so that case is kept out at the *entry* gate, which now
+        demands the assumed reversion exceed the round-trip spread and fees
+        before a fade is ever opened.
+        """
         if position.cost_usd <= 0:
             return ExitDecision(False)
 
@@ -141,29 +153,43 @@ class ExitEngine:
         if not liq.executable:
             return ExitDecision(False, detail=liq.reason)
 
-        profit_pct = (liq.net_usd - position.cost_usd) / position.cost_usd
+        realized_pct = (liq.net_usd - position.cost_usd) / position.cost_usd
 
-        if profit_pct >= Decimal(str(self.config.take_profit_pct)):
+        if realized_pct >= Decimal(str(self.config.take_profit_pct)):
             return ExitDecision(
                 True,
                 reason="take_profit",
                 proceeds_usd=liq.net_usd,
                 pnl_usd=liq.net_usd - position.cost_usd,
-                detail=f"net {profit_pct * 100:.2f}% vs target {self.config.take_profit_pct * 100:.2f}%",
+                detail=f"realizable net {realized_pct * 100:.2f}% vs target {self.config.take_profit_pct * 100:.2f}%",
             )
-        if profit_pct <= -Decimal(str(self.config.stop_loss_pct)):
+        if realized_pct <= -Decimal(str(self.config.stop_loss_pct)):
             return ExitDecision(
                 True,
                 reason="stop_loss",
                 proceeds_usd=liq.net_usd,
                 pnl_usd=liq.net_usd - position.cost_usd,
-                detail=f"net {profit_pct * 100:.2f}% vs stop -{self.config.stop_loss_pct * 100:.2f}%",
+                detail=f"realizable net {realized_pct * 100:.2f}% vs stop -{self.config.stop_loss_pct * 100:.2f}%",
             )
-        return ExitDecision(False, detail=f"net {profit_pct * 100:.2f}% within band")
+        return ExitDecision(False, detail=f"realizable net {realized_pct * 100:.2f}% within band")
 
     # -------------------------------------------------------------- execution
-    def close(self, position: Position, group: MarketGroup, decision: ExitDecision) -> bool:
-        """Submit the sell orders for a position and book the result."""
+    def close(
+        self,
+        position: Position,
+        group: MarketGroup,
+        decision: ExitDecision,
+        fee: FeeModel | None = None,
+    ) -> bool:
+        """Submit the sell orders for a position and book the result.
+
+        ``fee`` must be the same model :meth:`liquidate` used, so the booked
+        proceeds match the proceeds the exit decision was made on. It defaults
+        to a fee-free model only so callers that price their books without fees
+        keep working.
+        """
+        if fee is None:
+            fee = FeeModel.for_market(fees_enabled=False)
         sets = position.guaranteed_sets
         proceeds = ZERO
         sold: dict[str, Decimal] = {}
@@ -172,7 +198,7 @@ class ExitEngine:
         for leg in position.legs:
             sell_shares = min(leg.shares, sets) if position.hedged else leg.shares
             book = self._book_for(group, leg.token_id)
-            price = self._limit_price(book, leg.entry_price)
+            price = self._limit_price(book, sell_shares)
             if price <= 0:
                 all_ok = False
                 log.warning("no bid to exit %s (%s)", position.title[:40], leg.outcome_name)
@@ -191,7 +217,13 @@ class ExitEngine:
             )
             if result.ok and result.filled_shares > 0:
                 sold[leg.token_id] = sold.get(leg.token_id, ZERO) + result.filled_shares
-                proceeds += result.filled_usd
+                # Charge the taker fee on the way out, exactly as
+                # :meth:`liquidate` did when it decided to exit. Booking gross
+                # proceeds while the decision was made on net is what made the
+                # printed stop PnL and the realized PnL disagree.
+                fill_price = result.filled_usd / result.filled_shares if result.filled_shares > 0 else price
+                fee_usd = fee.sell_fee(result.filled_shares, fill_price)
+                proceeds += result.filled_usd - fee_usd
                 if result.filled_shares < sell_shares:
                     all_ok = False
                     log.warning(
@@ -240,11 +272,20 @@ class ExitEngine:
         return None
 
     @staticmethod
-    def _limit_price(book: OrderBook | None, entry_price: Decimal) -> Decimal:
-        """Worst price we accept: the best bid, never below a tick of value."""
-        if book is None or not book.bids:
+    def _limit_price(book: OrderBook | None, shares: Decimal) -> Decimal:
+        """Average bid price the whole size would realise, zero if too thin.
+
+        Deliberately the same bid walk :meth:`liquidate` uses, so the proceeds
+        the exit books match the proceeds the decision was made on. Quoting a
+        single top-of-book price for a size the book cannot support there is
+        how the logged stop PnL and the realized PnL drifted apart.
+        """
+        if book is None or not book.bids or shares <= 0:
             return ZERO
-        return book.bids[0].price
+        estimate = book.proceeds_to_sell(shares)
+        if estimate.shares < shares:
+            return ZERO
+        return estimate.avg_price
 
     # ------------------------------------------------------------- settlement
     def settlement_payout(self, position: Position, winning_token_ids: tuple[str, ...]) -> Decimal:

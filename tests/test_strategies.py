@@ -345,6 +345,53 @@ def test_fade_passes_its_own_filters_on_a_liquid_market():
     assert [s.kind for s in signals] == ["fade_extreme"]
 
 
+def test_fade_rejects_a_market_whose_round_trip_alone_would_stop_it_out():
+    """A 2c market with a one-tick spread is a structural stop-out.
+
+    Entering at 0.02 and exiting at 0.01 is a 50% loss before the price has
+    moved at all, well past the 30% stop. The old gate priced the assumed move
+    against the ask and ignored the spread, so it opened exactly this trade and
+    the next cycle's stop fired with the book unmoved. Reproduced four times in
+    the live log.
+    """
+    trap = binary_group(
+        yes_asks=[("0.02", "5000")], yes_bids=[("0.01", "5000")],
+        no_asks=[("0.98", "5000")], no_bids=[("0.97", "5000")],
+        volume_24h=Decimal("100000"), liquidity=Decimal("50000"),
+    )
+    assert FadeExtremeStrategy(make_config()).evaluate(trap, FEE_FREE) is None
+
+
+def test_fade_accepts_a_tight_spread_on_the_same_cheap_market():
+    """The same 2c market is fine when the book is one tick wide, not two."""
+    tight = binary_group(
+        yes_asks=[("0.02", "5000")], yes_bids=[("0.019", "5000")],
+        no_asks=[("0.98", "5000")], no_bids=[("0.979", "5000")],
+        volume_24h=Decimal("100000"), liquidity=Decimal("50000"),
+    )
+    signal = FadeExtremeStrategy(make_config()).evaluate(tight, FEE_FREE)
+    assert signal is not None
+    # The payout is the assumed exit net of costs, so it must sit below the
+    # assumed exit price and above the entry, never above the raw midpoint.
+    assert signal.cost_per_set < signal.payout_per_set
+    assert signal.edge_per_set == signal.payout_per_set - signal.cost_per_set
+
+
+def test_fade_edge_is_net_of_the_round_trip_spread():
+    """The reported edge must already have paid the spread on both sides."""
+    market = binary_group(
+        yes_asks=[("0.02", "5000")], yes_bids=[("0.018", "5000")],
+        no_asks=[("0.98", "5000")], no_bids=[("0.978", "5000")],
+        volume_24h=Decimal("100000"), liquidity=Decimal("50000"),
+    )
+    signal = FadeExtremeStrategy(make_config()).evaluate(market, FEE_FREE)
+    assert signal is not None
+    move = Decimal(signal.metadata["assumed_move"])
+    spread = Decimal(signal.metadata["spread_cost"])
+    assert spread == Decimal("0.002")
+    assert signal.edge_per_set == move - spread
+
+
 def test_disabled_strategies_do_not_emit_signals():
     group = binary_group(
         yes_asks=[("0.45", "500")], yes_bids=[("0.44", "500")],

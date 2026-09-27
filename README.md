@@ -7,7 +7,7 @@ depth, and executes through a broker you can swap between paper and live.
 - **No dependencies for paper mode.** Standard library only.
 - **Arbitrage first.** Two risk-free strategies enabled by default.
 - **Honest numbers.** Fees, slippage, and book depth are modelled per leg.
-- **171 tests**, no network required to run them.
+- **196 tests**, no network required to run them.
 
 ```
 $ python run.py doctor
@@ -152,6 +152,14 @@ A market can only be bought once. The per-market cooldown is just a timer and
 will always expire, so a separate guard refuses any entry while a position on
 that market is still open. Closing a position frees the market again.
 
+The one exception is a **stop-loss**. Because the exit pass runs before the
+entry pass, a stopped position would otherwise free its own slot and the same
+signal would be re-opened on the very next line — one bad trade billed four
+times. A stopped market is therefore blocked from re-entry for
+`POLYMARKET_BOT_REENTRY_COOLDOWN_S` (15 minutes by default). That market's
+thesis just failed; the timer is there so the bot stops mistaking "the slot is
+free" for "the trade is still good".
+
 ## Commands
 
 | Command | What it does |
@@ -198,6 +206,8 @@ The ones that matter most:
 | `POLYMARKET_BOT_TAKE_PROFIT_PCT` | `0.15` | Profit at which a position is sold |
 | `POLYMARKET_BOT_STOP_LOSS_PCT` | `0.30` | Loss at which a position is cut |
 | `POLYMARKET_BOT_MAX_THEME_EXPOSURE_USD` | `150` | Cap shared by correlated markets |
+| `POLYMARKET_BOT_REENTRY_COOLDOWN_S` | `900` | No re-buy of a stopped market for this long |
+| `POLYMARKET_BOT_FADE_MAX_ROUND_TRIP_RATIO` | `0.25` | Max spread+fees for a fade, as a fraction of entry |
 | `POLYMARKET_BOT_KILL_SWITCH` | `false` | Detect but never trade |
 
 ## Going live
@@ -266,7 +276,7 @@ polymarket_bot/
   portfolio.py    cash ledger and positions
   engine.py       the scan/decide/execute loop
   cli.py          command line interface
-tests/            171 tests, no network
+tests/            196 tests, no network
 ```
 
 ## Tests

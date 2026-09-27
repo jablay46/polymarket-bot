@@ -257,11 +257,25 @@ def parse_resolution(raw: dict) -> Resolution | None:
 
 @dataclass
 class ScannerStats:
+    """Counters for the most recent scan.
+
+    Reset at the start of every :meth:`MarketScanner.scan`, so the "scan
+    complete" log describes the cycle that just ran rather than a running
+    total that only ever grows.
+    """
+
     markets_seen: int = 0
     groups_built: int = 0
     books_fetched: int = 0
     books_missing: int = 0
     errors: int = 0
+
+    def reset(self) -> None:
+        self.markets_seen = 0
+        self.groups_built = 0
+        self.books_fetched = 0
+        self.books_missing = 0
+        self.errors = 0
 
 
 @dataclass
@@ -594,7 +608,15 @@ class MarketScanner:
 
     # ------------------------------------------------------------- pipeline
     def scan(self) -> list[MarketGroup]:
-        """Return all candidate groups with books attached."""
+        """Return all candidate groups with books attached.
+
+        Every group that could produce a signal is returned; the per-cycle
+        headcount cap is applied by the engine to its single-market pass, not
+        here. Truncating to the top-N by volume here would drop the cross-market
+        ladder candidates the pagination was added to find, because threshold
+        ladders rank well below the top of the volume table.
+        """
+        self.stats.reset()
         groups: list[MarketGroup] = []
 
         binary_infos: list[MarketInfo] = []
@@ -630,8 +652,6 @@ class MarketScanner:
                 groups.append(group)
 
         self.stats.groups_built += len(groups)
-        if self.config.max_markets_per_cycle > 0:
-            groups = groups[: self.config.max_markets_per_cycle]
         log.info(
             "scan complete: %d markets, %d books (%d missing), %d groups",
             self.stats.markets_seen,

@@ -36,18 +36,22 @@ def make_config(**overrides) -> Config:
     return Config(**defaults)
 
 
-def arb_group(ask_yes="0.45", ask_no="0.50") -> MarketGroup:
+def arb_group(ask_yes="0.45", ask_no="0.50", bid_yes=None, bid_no=None) -> MarketGroup:
     def book(ask, bid):
         return OrderBook.from_api(
             {"asks": [{"price": ask, "size": "500"}], "bids": [{"price": bid, "size": "500"}], "tick_size": "0.01"}
         )
 
+    if bid_yes is None:
+        bid_yes = str(Decimal(ask_yes) - Decimal("0.01"))
+    if bid_no is None:
+        bid_no = str(Decimal(ask_no) - Decimal("0.01"))
     return MarketGroup(
         group_id="g1",
         title="Arb market",
         outcomes=(
-            Outcome(0, "Yes", "yes", book(ask_yes, str(Decimal(ask_yes) - Decimal("0.01")))),
-            Outcome(1, "No", "no", book(ask_no, str(Decimal(ask_no) - Decimal("0.01")))),
+            Outcome(0, "Yes", "yes", book(ask_yes, bid_yes)),
+            Outcome(1, "No", "no", book(ask_no, bid_no)),
         ),
         volume_24h=Decimal("100000"),
         liquidity=Decimal("50000"),
@@ -83,9 +87,13 @@ def build_engine(groups, **overrides):
     engine.scanner = FakeScanner(groups)
     engine.broker = PaperBroker(config)
     from polymarket_bot.execution import ExecutionEngine
+    from polymarket_bot.exits import ExitEngine
 
     engine.portfolio = Portfolio(Decimal("1000"))
     engine.execution = ExecutionEngine(config, engine.broker, engine.portfolio)
+    # Rebuild exits against the same portfolio the test asserts on; leaving the
+    # one __post_init__ built would point the exit path at a different ledger.
+    engine.exits = ExitEngine(config, engine.broker, engine.portfolio)
     return engine
 
 
@@ -198,6 +206,45 @@ def test_cycle_reenters_after_the_position_is_closed():
     assert engine.portfolio.open_positions == 1
 
 
+def test_stopped_market_is_blocked_from_immediate_reentry():
+    """A stop-loss must not be followed by the same buy on the next line.
+
+    The exit pass runs before entry in a cycle, so a stopped position leaves
+    the ledger and the identical signal is immediately re-opened. That churn
+    turned one bad fade into four repeat losses in the live log.
+    """
+    engine = build_engine([arb_group()])
+    engine.run_cycle()
+    assert engine.portfolio.open_positions == 1
+    position = engine.portfolio.positions[0]
+
+    # Blow the book out so the next cycle's stop fires, then let the strategy
+    # try to re-enter the now-empty slot.
+    engine._cooldowns.clear()
+    engine.scanner = FakeScanner([arb_group(ask_yes="0.45", ask_no="0.50", bid_yes="0.10", bid_no="0.45")])
+    first = engine.run_cycle()
+    assert first.stop_losses == 1
+    assert engine.portfolio.open_positions == 0
+    assert engine.portfolio.blocked(position.group_id)
+
+    # Restore the profitable book; the blocklist, not the cooldown, must keep
+    # the bot out.
+    engine._cooldowns.clear()
+    engine.scanner = FakeScanner([arb_group()])
+    second = engine.run_cycle()
+    assert second.orders_filled == 0
+    assert engine.portfolio.open_positions == 0
+
+
+def test_blocklist_expires_after_the_configured_cooldown():
+    import time
+
+    engine = build_engine([arb_group()], reentry_cooldown_seconds=60)
+    engine.portfolio.block_reentry("g1", 60)
+    assert engine.portfolio.blocked("g1")
+    assert not engine.portfolio.blocked("g1", now=time.time() + 120)
+
+
 def test_run_forever_stops_after_max_cycles():
     engine = build_engine([arb_group()], poll_interval_seconds=1)
     engine.run_forever(max_cycles=2)
@@ -259,9 +306,11 @@ def build_ladder_engine(groups, **overrides):
     engine.scanner = LadderScanner(groups)
     engine.broker = PaperBroker(config)
     from polymarket_bot.execution import ExecutionEngine
+    from polymarket_bot.exits import ExitEngine
 
     engine.portfolio = Portfolio(Decimal("1000"))
     engine.execution = ExecutionEngine(config, engine.broker, engine.portfolio)
+    engine.exits = ExitEngine(config, engine.broker, engine.portfolio)
     return engine
 
 
@@ -328,4 +377,60 @@ def test_cross_market_does_not_rebuy_a_held_pair():
     engine._cooldowns.clear()
     second = engine.run_cycle()
     assert second.orders_filled == 0
+    assert engine.portfolio.open_positions == 1
+
+
+# ----------------------------------------------------------- correlation cap
+
+
+def test_unresolved_theme_still_buckets_correlated_markets():
+    """A failed tag lookup must not skip the correlation cap.
+
+    When ``_theme_for`` returned "" the risk manager treated the position as
+    uncapped, so several markets on one event could each take a full theme
+    budget. Falling back to the event id keeps them under one cap.
+    """
+    engine = build_engine([arb_group()])
+    first = arb_group()
+    first.metadata["event_id"] = "ev1"
+    second = arb_group()
+    second.metadata["event_id"] = "ev2"
+
+    class NoTags:
+        def fetch_themes(self, ids):
+            return {}
+
+    engine.scanner = NoTags()
+    theme_a = engine._theme_for(first)
+    theme_b = engine._theme_for(second)
+
+    assert theme_a and theme_a != theme_b
+    # Markets on the same event share one bucket even with no tags.
+    assert engine._theme_for(first) == theme_a
+
+
+def test_market_without_an_event_is_still_capped_as_its_own_bucket():
+    engine = build_engine([arb_group()])
+
+    class NoTags:
+        def fetch_themes(self, ids):
+            return {}
+
+    engine.scanner = NoTags()
+    group = arb_group()
+    assert engine._theme_for(group) == "group:g1"
+
+
+def test_cross_market_still_sees_groups_past_the_single_market_cap():
+    """The headcount cap must not starve the ladder scan.
+
+    Ladder legs rank low by volume, so a cap that trimmed the shared list would
+    drop them before the cross-market pass ran and it would never fire.
+    """
+    groups = [ladder_group("90,000", "0xlo"), ladder_group("100,000", "0xhi")]
+    engine = build_ladder_engine(groups, max_markets_per_cycle=1)
+
+    stats = engine.run_cycle()
+
+    assert stats.orders_filled == 1
     assert engine.portfolio.open_positions == 1

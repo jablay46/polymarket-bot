@@ -166,7 +166,9 @@ class TradingEngine:
             return ""
         event_id = str(group.metadata.get("event_id") or "")
         if not event_id:
-            return ""
+            # No event to correlate on: bucket the market by itself so the
+            # per-market cap still applies rather than the check being skipped.
+            return f"group:{group.group_id}" if group.group_id else ""
         if event_id in self._themes:
             return self._themes[event_id]
         try:
@@ -175,6 +177,11 @@ class TradingEngine:
             log.debug("theme lookup failed for %s: %s", event_id, exc)
             found = {}
         theme = found.get(event_id, "")
+        # An unresolved theme must still be bucketable. Falling back to the
+        # event id keeps markets that share an event — the correlated ones —
+        # under one cap even when the tag lookup returns nothing, instead of
+        # returning "" and silently skipping the correlation check.
+        theme = theme or f"event:{event_id}"
         self._themes[event_id] = theme
         return theme
 
@@ -226,9 +233,18 @@ class TradingEngine:
         if self.config.exits_enabled:
             self._run_exits(groups, stats)
 
-        for group in groups:
+        # The single-market pass is capped by headcount; the cross-market pass
+        # below still sees every group, because ladder candidates rank too low
+        # by volume to survive the cap.
+        market_groups = groups
+        if self.config.max_markets_per_cycle > 0:
+            market_groups = groups[: self.config.max_markets_per_cycle]
+
+        for group in market_groups:
             stats.groups_evaluated += 1
             if self._on_cooldown(group.group_id, now):
+                continue
+            if self.portfolio is not None and self.portfolio.blocked(group.group_id):
                 continue
             try:
                 fee = self._fee_model(group)
@@ -506,24 +522,44 @@ class TradingEngine:
             if not self.risk.rate_ok():
                 log.debug("rate limit hit; deferring exit for %s", position.title[:40])
                 continue
-            log.info(
-                "%s %s pnl=$%.2f (%s)",
-                "STOP-LOSS" if decision.reason == "stop_loss" else "TAKE-PROFIT",
-                position.title[:48],
-                decision.pnl_usd,
-                decision.detail,
-            )
-            if self.exits.close(position, group, decision):
+            if self.exits.close(position, group, decision, fee):
                 stats.exits += 1
                 if decision.reason == "stop_loss":
                     stats.stop_losses += 1
+                    # A stopped market is a market whose thesis just failed, so
+                    # do not immediately re-buy the same signal. Without this the
+                    # exit (which runs before entry) frees the slot and the very
+                    # next strategy pass re-opens the identical position.
+                    self._block_reentry(position)
                 # Book what the fills actually returned, not the pre-trade
                 # estimate: a partly filled exit realizes less than planned.
-                stats.realized_usd += self.exits.last_pnl
+                booked = self.exits.last_pnl
+                stats.realized_usd += booked
                 if self.exits.last_remaining > 0:
                     stats.partial_exits += 1
+                # Log the PnL that was booked, so the printed figure and the
+                # portfolio's realized total always agree.
+                log.info(
+                    "BOOKED %s %s pnl=$%.2f (estimated $%.2f) — %s",
+                    "STOP-LOSS" if decision.reason == "stop_loss" else "TAKE-PROFIT",
+                    position.title[:44],
+                    booked,
+                    decision.pnl_usd,
+                    decision.detail,
+                )
             else:
                 stats.errors += 1
+
+    def _block_reentry(self, position) -> None:
+        if self.portfolio is None:
+            return
+        seconds = self.config.reentry_cooldown_seconds
+        self.portfolio.block_reentry(position.group_id, seconds)
+        # A cross-market or basket position also owns its leg condition ids, so
+        # block each of them too; otherwise the ladder could be re-entered from
+        # the other side.
+        for leg in position.legs:
+            self.portfolio.block_reentry(getattr(leg, "condition_id", ""), seconds)
 
     def _execute(
         self,

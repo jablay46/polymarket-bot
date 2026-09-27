@@ -227,8 +227,15 @@ def cmd_scan(args) -> int:
     print(f"{len(found)} opportunit(ies):")
     for group, sig in found:
         print(f"  {sig.describe()}")
+        # A directional signal's "profit" is its own model's assumption, not a
+        # locked-in number. Calling both "expected_profit" would present the
+        # guess and the guarantee as the same kind of figure.
+        directional = bool(sig.metadata.get("directional")) or bool(
+            sig.metadata.get("unverified_relation")
+        )
+        label = "assumed_profit" if directional else "locked_profit"
         print(
-            f"      max_sets={sig.max_sets} expected_profit=${sig.expected_profit_usd:.2f} "
+            f"      max_sets={sig.max_sets} {label}=${sig.expected_profit_usd:.2f} "
             f"confidence={sig.confidence:.2f} strategy={STRATEGY_LABELS.get(sig.kind, sig.kind)}"
         )
     return 0
