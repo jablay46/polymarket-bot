@@ -7,6 +7,7 @@ loaded, so `.env` always takes effect. See `polymarket_bot.env`.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
+from pathlib import Path
 
 from .env import ensure_loaded, get_bool, get_float, get_int, get_str
 
@@ -304,6 +305,14 @@ class Config:
             raise ConfigError("reentry_cooldown_seconds must be non-negative")
         if self.cross_market_scan_pages < 1:
             raise ConfigError("cross_market_scan_pages must be >= 1")
+        if self.ca_bundle:
+            path = Path(self.ca_bundle)
+            if not path.is_file():
+                raise ConfigError(
+                    f"POLYMARKET_BOT_CA_BUNDLE points at {self.ca_bundle!r}, which is not a file. "
+                    "Set it to the proxy's root CA in PEM format, or leave it unset to use the "
+                    "system trust store."
+                )
 
     # --------------------------------------------------------------- helpers
     @property

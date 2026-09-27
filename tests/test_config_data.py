@@ -8,7 +8,7 @@ from decimal import Decimal
 import pytest
 
 from polymarket_bot.config import Config, ConfigError
-from polymarket_bot.data import HttpClient, MarketScanner, TlsError, parse_market
+from polymarket_bot.data import DataError, HttpClient, MarketScanner, TlsError, parse_market
 from polymarket_bot.env import load_dotenv
 
 
@@ -372,5 +372,50 @@ def test_ca_bundle_is_passed_into_ssl_context(tmp_path):
 
     unset = HttpClient()
     assert unset._ssl_context is None
+
+
+def test_missing_ca_bundle_is_rejected_at_config_validation(monkeypatch):
+    """A CA bundle path that is not a file must fail with a named config error.
+
+    Otherwise the user sees a raw FileNotFoundError from ssl deep inside
+    MarketScanner with no hint about which setting is wrong.
+    """
+    monkeypatch.setenv("POLYMARKET_BOT_CA_BUNDLE", "/path/to/proxy-ca.pem")
+
+    with pytest.raises(ConfigError) as excinfo:
+        Config.from_env()
+
+    message = str(excinfo.value)
+    assert "POLYMARKET_BOT_CA_BUNDLE" in message
+    assert "/path/to/proxy-ca.pem" in message
+
+
+def test_unloadable_ca_bundle_raises_data_error_not_file_not_found(tmp_path):
+    """Even bypassing validation, a bad bundle must surface as DataError."""
+    bad = tmp_path / "not-a-cert.pem"
+    bad.write_text("this is not a certificate\n")
+
+    with pytest.raises(DataError) as excinfo:
+        HttpClient(ca_bundle=str(bad))
+
+    assert "CA_BUNDLE" in str(excinfo.value)
+
+
+def test_doctor_survives_unbuildable_scanner(monkeypatch, capsys):
+    """Regression: doctor must not traceback when the scanner cannot be built."""
+    from polymarket_bot import cli
+    from polymarket_bot.data import DataError
+
+    def boom(self):
+        raise DataError("POLYMARKET_BOT_CA_BUNDLE='/nope.pem' could not be loaded")
+
+    monkeypatch.setattr(MarketScanner, "__post_init__", boom)
+
+    rc = cli.main(["doctor"])
+    out = capsys.readouterr().out
+
+    assert rc == 1
+    assert "FAIL: POLYMARKET_BOT_CA_BUNDLE" in out
+    assert "doctor: FAIL" in out
 
 

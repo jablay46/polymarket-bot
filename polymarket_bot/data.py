@@ -94,7 +94,14 @@ class HttpClient:
         self.ca_bundle = ca_bundle
         self._ssl_context = None
         if ca_bundle:
-            self._ssl_context = ssl.create_default_context(cafile=ca_bundle)
+            try:
+                self._ssl_context = ssl.create_default_context(cafile=ca_bundle)
+            except (OSError, ssl.SSLError) as exc:
+                raise DataError(
+                    f"POLYMARKET_BOT_CA_BUNDLE={ca_bundle!r} could not be loaded as a PEM bundle: {exc}. "
+                    "Point it at a readable PEM file of root CAs, or leave it unset to use the "
+                    "system trust store."
+                ) from exc
 
     def _request(self, url: str, data: bytes | None = None, method: str = "GET") -> object:
         last_error: Exception | None = None

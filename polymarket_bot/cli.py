@@ -105,34 +105,40 @@ def cmd_doctor(args) -> int:
         print(f"      FAIL: {exc}")
 
     print("[2/4] market data connectivity")
-    scanner = MarketScanner(config)
-    # Bound before the fetch so every later section degrades to a SKIP/WARN
-    # when Gamma is unreachable, instead of crashing on an unbound name.
+    # Bound before construction so the section degrades to WARN/SKIP instead of
+    # crashing when the client cannot be built (e.g. an unreadable CA bundle).
+    scanner = None
     markets: list = []
     try:
-        markets = scanner.fetch_binary_markets(limit=3)
-        print(f"      OK: fetched {len(markets)} markets from Gamma")
+        scanner = MarketScanner(config)
     except DataError as exc:
         ok = False
         print(f"      FAIL: {exc}")
-    try:
-        books = scanner.fetch_books([m.token_ids[0] for m in markets[:2]]) if markets else {}
-        if books:
-            sample = next(iter(books.values()))
-            print(
-                f"      OK: book has {len(sample.bids)} bids / {len(sample.asks)} asks, "
-                f"best bid={sample.best_bid} best ask={sample.best_ask}"
-            )
-            if sample.asks and sample.asks[0].price > sample.asks[-1].price:
-                print("      OK: best ask is the lowest price (book sorted correctly)")
-        else:
-            print("      WARN: no books returned")
-    except DataError as exc:
-        ok = False
-        print(f"      FAIL: {exc}")
+    if scanner is not None:
+        try:
+            markets = scanner.fetch_binary_markets(limit=3)
+            print(f"      OK: fetched {len(markets)} markets from Gamma")
+        except DataError as exc:
+            ok = False
+            print(f"      FAIL: {exc}")
+        try:
+            books = scanner.fetch_books([m.token_ids[0] for m in markets[:2]]) if markets else {}
+            if books:
+                sample = next(iter(books.values()))
+                print(
+                    f"      OK: book has {len(sample.bids)} bids / {len(sample.asks)} asks, "
+                    f"best bid={sample.best_bid} best ask={sample.best_ask}"
+                )
+                if sample.asks and sample.asks[0].price > sample.asks[-1].price:
+                    print("      OK: best ask is the lowest price (book sorted correctly)")
+            else:
+                print("      WARN: no books returned")
+        except DataError as exc:
+            ok = False
+            print(f"      FAIL: {exc}")
 
     print("[3/4] fee model")
-    if markets:
+    if scanner is not None and markets:
         info = markets[0]
         rate = scanner.fee_rate_for(info)
         print(
