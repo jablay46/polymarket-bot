@@ -340,6 +340,11 @@ def test_tls_verification_failure_raises_actionable_tls_error(monkeypatch):
         )
 
     monkeypatch.setattr(urllib.request, "urlopen", bad_cert)
+    # The hint probes the served certificate; keep the test offline.
+    monkeypatch.setattr(
+        "polymarket_bot.data.describe_peer_certificate",
+        lambda host, *a, **k: "subject CN='interceptor', SAN=[other.example]",
+    )
 
     client = HttpClient(timeout=0.01, max_retries=3)
     with pytest.raises(TlsError) as excinfo:
@@ -349,8 +354,23 @@ def test_tls_verification_failure_raises_actionable_tls_error(monkeypatch):
     assert "TLS verification failed" in message
     assert "gamma-api.polymarket.com" in message
     assert "POLYMARKET_BOT_CA_BUNDLE" in message
+    assert "interceptor" in message
     # Fails on the first attempt: no retry loop for a bad certificate.
     assert calls["n"] == 1
+
+
+def test_describe_peer_certificate_never_raises(monkeypatch):
+    """Diagnostics must degrade to text, not blow up the error path."""
+    import socket
+
+    def boom(*a, **k):
+        raise socket.gaierror("name resolution failed")
+
+    monkeypatch.setattr(socket, "create_connection", boom)
+    from polymarket_bot.data import describe_peer_certificate
+
+    text = describe_peer_certificate("nope.invalid")
+    assert "unavailable" in text
 
 
 def test_ca_bundle_is_passed_into_ssl_context(tmp_path):

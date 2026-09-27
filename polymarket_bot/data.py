@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import random
+import socket
 import ssl
 import threading
 import time
@@ -69,6 +70,41 @@ class TlsError(DataError):
     host, and the operator needs a specific hint rather than a five-line
     ``urlopen`` traceback.
     """
+
+
+def describe_peer_certificate(host: str, port: int = 443, timeout: float = 6.0) -> str:
+    """Best-effort description of the certificate a host actually serves.
+
+    Used only to explain a TLS failure. It opens a second connection with the
+    chain *still validated* but hostname checking disabled, so it cannot be
+    tricked into vouching for an impostor: an untrusted certificate is reported
+    as such rather than described. Returns a short human-readable string and
+    never raises.
+    """
+    try:
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            with context.wrap_socket(sock, server_hostname=host) as tls:
+                cert = tls.getpeercert()
+    except ssl.SSLCertVerificationError as exc:
+        return f"a certificate that is not trusted by the system store ({exc.verify_message or exc})"
+    except Exception as exc:  # noqa: BLE001 - diagnostics must never raise
+        return f"unavailable ({type(exc).__name__}: {exc})"
+
+    subject = dict(x[0] for x in cert.get("subject", ()))
+    issuer = dict(x[0] for x in cert.get("issuer", ()))
+    sans = [value for kind, value in cert.get("subjectAltName", ()) if kind == "DNS"]
+    cn = subject.get("commonName", "?")
+    issuer_cn = issuer.get("commonName", "?")
+    issuer_org = issuer.get("organizationName", "")
+    not_after = cert.get("notAfter", "?")
+    san_text = ", ".join(sans[:6]) if sans else "none"
+    return (
+        f"subject CN={cn!r}, issuer={issuer_cn!r}"
+        + (f" ({issuer_org})" if issuer_org else "")
+        + f", SAN=[{san_text}], expires={not_after}"
+    )
 
 
 # --------------------------------------------------------------------- HTTP
@@ -132,15 +168,17 @@ class HttpClient:
 
     def _tls_hint(self, url: str, exc: Exception) -> str:
         host = urllib.parse.urlparse(url).hostname or url
+        served = describe_peer_certificate(host)
         return (
             f"TLS verification failed for {host}: {exc}. "
             "This is almost always the network, not the bot: something between "
             "this host and Polymarket is presenting a certificate that does not "
-            "match the hostname (a TLS-intercepting proxy or firewall), or the "
-            "system trust store is out of date. Fixes: install the proxy's root "
-            "CA into the system trust store, or point the bot at it with "
-            "POLYMARKET_BOT_CA_BUNDLE=/path/to/ca.pem. Do not disable "
-            "verification to work around this."
+            "match the hostname (a TLS-intercepting proxy, VPN, or firewall), or "
+            "the system trust store is out of date. "
+            f"Certificate actually served for {host}: {served}. "
+            "Fixes: install the proxy's root CA into the system trust store, or "
+            "point the bot at it with POLYMARKET_BOT_CA_BUNDLE=/path/to/ca.pem. "
+            "Do not disable verification to work around this."
         )
 
 
