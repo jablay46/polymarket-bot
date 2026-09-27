@@ -7,7 +7,7 @@ depth, and executes through a broker you can swap between paper and live.
 - **No dependencies for paper mode.** Standard library only.
 - **Arbitrage first.** Two risk-free strategies enabled by default.
 - **Honest numbers.** Fees, slippage, and book depth are modelled per leg.
-- **203 tests**, no network required to run them.
+- **211 tests**, no network required to run them.
 
 ```
 $ python run.py doctor

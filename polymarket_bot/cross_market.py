@@ -60,6 +60,25 @@ MAX_LEVELS = 40
 log = get_logger("cross_market")
 
 
+def _resolve_yes_index(market) -> int:
+    """Index of the Yes token in a two-outcome market.
+
+    Gamma does not guarantee that ``clobTokenIds`` lists Yes first, so
+    ``token_ids[0]`` is not safe to treat as Yes. Prefer the market's own
+    resolution (``MarketInfo.yes_index``, matched by outcome name), then the
+    outcome literally named "yes", then fall back to 0 — a two-outcome market
+    with no Yes/No labels still partitions $1, so either side is a valid
+    reference there.
+    """
+    index = getattr(market, "yes_index", None)
+    if index in (0, 1):
+        return index
+    for i, name in enumerate(getattr(market, "outcomes", None) or ()):
+        if str(name).strip().lower() == "yes":
+            return i
+    return 0
+
+
 def candidate_from_market(market) -> ThresholdCandidate | None:
     """Build a ladder candidate from a scanned binary market, or None.
 
@@ -74,13 +93,15 @@ def candidate_from_market(market) -> ThresholdCandidate | None:
     threshold = extract_threshold(market.question)
     if threshold is None:
         return None
+    yes_index = _resolve_yes_index(market)
+    no_index = 1 - yes_index
     return ThresholdCandidate(
         market_id=market.market_id,
         condition_id=market.condition_id,
         question=market.question,
         threshold=threshold,
-        yes_token_id=market.token_ids[0],
-        no_token_id=market.token_ids[1],
+        yes_token_id=market.token_ids[yes_index],
+        no_token_id=market.token_ids[no_index],
         direction=extract_direction(market.question),
         tick_size=market.tick_size,
         neg_risk=bool(market.neg_risk),

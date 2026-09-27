@@ -38,15 +38,22 @@ from .models import ZERO
 # Words that mark a threshold as crossed from above or from below. Kept as
 # shared fragments so the threshold matcher and the direction matcher can
 # never drift apart.
-_ABOVE_WORDS = r"exceed|above|over|reach|hit|surpass|more than|greater than"
+_ABOVE_WORDS = r"exceed|above|over|reach|hit|surpass|more than|greater than|at least|no less than|not less than"
 _BELOW_WORDS = r"no more than|not above|not more than|at most|below|under|less than|lower than"
 
 # Matches "$90k", "$90,000", "90000", "$1.5m" style thresholds in a question.
 # Below-markers come first so "no more than $90k" reads as one below-threshold
-# rather than "more than $90k" (an above-threshold) found mid-phrase.
+# rather than "more than $90k" (an above-threshold) found mid-phrase, and the
+# longer negation forms ("no less than") sit in _ABOVE_WORDS ahead of the bare
+# "less than" they contain. An optional article ("the $90k mark") is allowed
+# between the marker and the number, since it is filler that does not change
+# the claim.
+#
+# The suffix must be a whole word: without the trailing \b, "the $90,000 mark"
+# matches the "m" of "mark" as the million suffix and reads 90 billion.
 _THRESHOLD_RE = re.compile(
-    rf"(?:{_BELOW_WORDS}|{_ABOVE_WORDS}|>=?|<=?)\s*\$?"
-    r"(\d[\d,]*\.?\d*)\s*(k|m|thousand|million)?",
+    rf"(?:{_BELOW_WORDS}|{_ABOVE_WORDS}|>=?|<=?)"
+    r"\s*(?:\s+(?:the|a|an)\b)?\s*\$?(\d[\d,]*\.?\d*)\s*(k|m|thousand|million)?\b",
     re.IGNORECASE,
 )
 
@@ -54,6 +61,11 @@ _MULTIPLIERS = {"k": 1_000, "thousand": 1_000, "m": 1_000_000, "million": 1_000_
 
 _DIRECTION_RE = re.compile(rf"\b(?:{_BELOW_WORDS}|{_ABOVE_WORDS})\b|>=?|<=?", re.IGNORECASE)
 _BELOW_ONLY_RE = re.compile(rf"^(?:{_BELOW_WORDS}|<=?)$", re.IGNORECASE)
+
+# Bare nouns that follow a threshold number ("the $90k mark/level/threshold")
+# and name the boundary rather than the subject. Left in the key they would
+# split "exceed $90k" from "exceed the $90k mark" into two buckets.
+_FILLER_RE = re.compile(r"\b(?:mark|marks|level|levels|threshold|thresholds)\b", re.IGNORECASE)
 
 
 def extract_threshold(question: str) -> Decimal | None:
@@ -104,6 +116,7 @@ def subject_key(question: str) -> str:
     """
     text = _THRESHOLD_RE.sub(" ", question)
     text = _DIRECTION_RE.sub(" ", text).lower()
+    text = _FILLER_RE.sub(" ", text)
     text = re.sub(r"[^a-z0-9]+", " ", text).strip()
     return text
 

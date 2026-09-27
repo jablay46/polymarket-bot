@@ -92,6 +92,24 @@ def test_extract_threshold_returns_none_without_a_number():
     assert extract_threshold("Will it rain tomorrow?") is None
 
 
+def test_extract_threshold_ignores_an_article_before_the_number():
+    assert extract_threshold("Will BTC exceed the $90,000 mark by Dec 31?") == Decimal("90000")
+    assert extract_threshold("Will BTC reach a $90k level?") == Decimal("90000")
+
+
+def test_extract_threshold_does_not_read_the_letter_m_of_a_word_as_a_suffix():
+    """Regression: "the $90,000 mark" parsed as 90 billion.
+
+    The k/m suffix matcher must only accept a suffix that is a whole word, or
+    the "m" of "mark" is read as "million".
+    """
+    assert extract_threshold("Will BTC exceed the $90,000 mark?") == Decimal("90000")
+
+
+def test_extract_threshold_handles_at_least():
+    assert extract_threshold("Will BTC be at least $90,000?") == Decimal("90000")
+
+
 def test_extract_direction_distinguishes_above_and_below():
     assert extract_direction("Will BTC be above $90k?") == "above"
     assert extract_direction("Will BTC exceed $90k?") == "above"
@@ -99,6 +117,16 @@ def test_extract_direction_distinguishes_above_and_below():
     assert extract_direction("Will BTC be under $90k?") == "below"
     # Defaults to "above" when nothing marks a direction.
     assert extract_direction("Will BTC hit $90k?") == "above"
+
+
+def test_extract_direction_reads_double_negatives_as_above():
+    """Regression: "not less than $90k" means at or above, not below.
+
+    The bare "less than" substring matched first and inverted the ladder.
+    """
+    assert extract_direction("Will BTC be not less than $90k?") == "above"
+    assert extract_direction("Will BTC be no less than $90k?") == "above"
+    assert extract_direction("Will BTC be no more than $90k?") == "below"
 
 
 def test_subject_key_collapses_same_subject_different_thresholds():
@@ -119,6 +147,13 @@ def test_subject_key_separates_different_subjects():
     a = subject_key("Will Bitcoin exceed $90,000 by December 31?")
     b = subject_key("Will Ethereum exceed $5,000 by December 31?")
     assert a != b
+
+
+def test_subject_key_ignores_threshold_filler_words():
+    """"the $90k mark" and "exceed $90k" are the same subject."""
+    a = subject_key("Will Bitcoin exceed $90,000 by December 31?")
+    b = subject_key("Will Bitcoin exceed the $90,000 mark by December 31?")
+    assert a == b
 
 
 def test_group_threshold_ladders_needs_at_least_two_members():
@@ -348,6 +383,14 @@ class _Market:
         self.condition_id = f"0x{market_id}"
         self.question = question
         self.token_ids = token_ids
+        self.outcomes = kwargs.get("outcomes", ("Yes", "No"))
+        if "yes_index" in kwargs:
+            self.yes_index = kwargs["yes_index"]
+        else:
+            self.yes_index = next(
+                (i for i, n in enumerate(self.outcomes) if str(n).strip().lower() == "yes"),
+                None,
+            )
         self.tick_size = kwargs.get("tick_size", Decimal("0.01"))
         self.neg_risk = kwargs.get("neg_risk", False)
         self.volume_24h = kwargs.get("volume_24h", 50000)
@@ -386,6 +429,48 @@ def test_candidate_from_market_carries_venue_settings():
 def test_candidate_from_market_skips_non_binary_and_thresholdless():
     assert candidate_from_market(_Market("m1", "Who wins?", ("a", "b", "c"))) is None
     assert candidate_from_market(_Market("m2", "Will it rain?", ("yes", "no"))) is None
+
+
+def test_candidate_from_market_resolves_yes_by_name_not_position():
+    """Gamma does not guarantee Yes is first in clobTokenIds.
+
+    Taking token_ids[0] as Yes would silently swap the two legs of the pair,
+    pricing a directional bet as an arbitrage. The candidate must follow the
+    outcome name instead.
+    """
+    market = _Market(
+        "m1",
+        "Will Bitcoin be above $90,000 by December 31?",
+        ("tok-no", "tok-yes"),
+        outcomes=("No", "Yes"),
+    )
+    candidate = candidate_from_market(market)
+    assert candidate is not None
+    assert candidate.yes_token_id == "tok-yes"
+    assert candidate.no_token_id == "tok-no"
+
+
+def test_candidate_from_market_uses_market_yes_index_when_present():
+    market = _Market(
+        "m1",
+        "Will Bitcoin be above $90,000 by December 31?",
+        ("tok-a", "tok-b"),
+        outcomes=("Foo", "Bar"),
+        yes_index=1,
+    )
+    candidate = candidate_from_market(market)
+    assert candidate is not None
+    assert candidate.yes_token_id == "tok-b"
+    assert candidate.no_token_id == "tok-a"
+
+
+def test_candidate_from_market_falls_back_to_first_token_without_labels():
+    """A two-outcome market with no Yes/No labels still partitions $1."""
+    market = _Market("m1", "Will Bitcoin be above $90,000 by December 31?", ("a", "b"))
+    candidate = candidate_from_market(market)
+    assert candidate is not None
+    assert candidate.yes_token_id == "a"
+    assert candidate.no_token_id == "b"
 
 
 # --------------------------------------------------------------- live gating
