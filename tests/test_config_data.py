@@ -295,3 +295,28 @@ def test_scanner_stats_describe_a_single_scan_not_a_running_total():
     scanner.stats.reset()
     scanner.fetch_binary_markets(limit=100, pages=1)
     assert scanner.stats.markets_seen == 100
+
+
+def test_doctor_reports_data_failure_without_crashing(monkeypatch, capsys):
+    """Regression: an unreachable Gamma must not crash `doctor`.
+
+    `markets` was bound only inside the fetch try-block, so when the request
+    raised DataError the next section read an unbound local and the whole
+    command died with UnboundLocalError instead of printing FAIL.
+    """
+    from polymarket_bot import cli
+    from polymarket_bot.data import DataError
+
+    def boom(self, limit=None, pages=1):
+        raise DataError("request failed after 3 attempts: gamma down")
+
+    monkeypatch.setattr(MarketScanner, "fetch_binary_markets", boom)
+
+    rc = cli.main(["doctor"])
+    out = capsys.readouterr().out
+
+    assert rc == 1
+    assert "FAIL: request failed" in out
+    assert "doctor: FAIL" in out
+    assert "SKIP: no market to inspect" in out
+

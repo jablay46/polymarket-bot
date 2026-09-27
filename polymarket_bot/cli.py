@@ -106,6 +106,9 @@ def cmd_doctor(args) -> int:
 
     print("[2/4] market data connectivity")
     scanner = MarketScanner(config)
+    # Bound before the fetch so every later section degrades to a SKIP/WARN
+    # when Gamma is unreachable, instead of crashing on an unbound name.
+    markets: list = []
     try:
         markets = scanner.fetch_binary_markets(limit=3)
         print(f"      OK: fetched {len(markets)} markets from Gamma")
