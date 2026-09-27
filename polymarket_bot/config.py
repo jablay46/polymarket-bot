@@ -38,6 +38,11 @@ class Config:
     clob_host: str = CLOB_HOST
     request_timeout: float = 10.0
     max_retries: int = 3
+    # Path to a PEM bundle of CA certificates to trust in addition to the system
+    # store. Empty uses the system store. Set this only when a TLS-intercepting
+    # proxy makes the exchange hosts fail verification on an otherwise healthy
+    # network.
+    ca_bundle: str = ""
 
     # ---- Scan loop ----------------------------------------------------------
     scan_limit: int = 100
@@ -174,6 +179,7 @@ class Config:
             clob_host=get_str("POLYMARKET_BOT_CLOB_HOST", CLOB_HOST),
             request_timeout=get_float("POLYMARKET_BOT_REQUEST_TIMEOUT", 10.0),
             max_retries=get_int("POLYMARKET_BOT_MAX_RETRIES", 3),
+            ca_bundle=get_str("POLYMARKET_BOT_CA_BUNDLE", ""),
             scan_limit=get_int("POLYMARKET_BOT_SCAN_LIMIT", 100),
             poll_interval_seconds=get_int("POLYMARKET_BOT_POLL_INTERVAL_S", 20),
             max_markets_per_cycle=get_int("POLYMARKET_BOT_MAX_MARKETS_PER_CYCLE", 60),

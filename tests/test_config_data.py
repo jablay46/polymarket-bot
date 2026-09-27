@@ -8,7 +8,7 @@ from decimal import Decimal
 import pytest
 
 from polymarket_bot.config import Config, ConfigError
-from polymarket_bot.data import MarketScanner, parse_market
+from polymarket_bot.data import HttpClient, MarketScanner, TlsError, parse_market
 from polymarket_bot.env import load_dotenv
 
 
@@ -319,4 +319,58 @@ def test_doctor_reports_data_failure_without_crashing(monkeypatch, capsys):
     assert "FAIL: request failed" in out
     assert "doctor: FAIL" in out
     assert "SKIP: no market to inspect" in out
+
+
+def test_tls_verification_failure_raises_actionable_tls_error(monkeypatch):
+    """A cert failure must name the cause, not just wrap urlopen.
+
+    Retrying cannot fix a bad certificate, so the client should fail on the
+    first attempt with a hint about the proxy/trust store rather than burning
+    all retries and reporting a generic network error.
+    """
+    import ssl
+    import urllib.request
+
+    calls = {"n": 0}
+
+    def bad_cert(*args, **kwargs):
+        calls["n"] += 1
+        raise ssl.SSLCertVerificationError(
+            1, "certificate verify failed: Hostname mismatch"
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", bad_cert)
+
+    client = HttpClient(timeout=0.01, max_retries=3)
+    with pytest.raises(TlsError) as excinfo:
+        client.get("https://gamma-api.polymarket.com/markets")
+
+    message = str(excinfo.value)
+    assert "TLS verification failed" in message
+    assert "gamma-api.polymarket.com" in message
+    assert "POLYMARKET_BOT_CA_BUNDLE" in message
+    # Fails on the first attempt: no retry loop for a bad certificate.
+    assert calls["n"] == 1
+
+
+def test_ca_bundle_is_passed_into_ssl_context(tmp_path):
+    """A configured CA bundle must actually build a verifying context.
+
+    Uses whatever PEM cert is on the box; the point is that the path is
+    threaded through to the client and parsed, not that any host validates
+    against it.
+    """
+    import glob
+
+    system_bundles = glob.glob("/etc/ssl/certs/ca-certificates.crt")
+    if not system_bundles:
+        pytest.skip("no system CA bundle available")
+    cert = system_bundles[0]
+
+    client = HttpClient(ca_bundle=cert)
+    assert client._ssl_context is not None
+
+    unset = HttpClient()
+    assert unset._ssl_context is None
+
 

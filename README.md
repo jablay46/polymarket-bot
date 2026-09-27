@@ -7,7 +7,7 @@ depth, and executes through a broker you can swap between paper and live.
 - **No dependencies for paper mode.** Standard library only.
 - **Arbitrage first.** Two risk-free strategies enabled by default.
 - **Honest numbers.** Fees, slippage, and book depth are modelled per leg.
-- **196 tests**, no network required to run them.
+- **199 tests**, no network required to run them.
 
 ```
 $ python run.py doctor
@@ -182,6 +182,22 @@ python run.py ladders --limit 300         # search deeper for ladder markets
 ```
 
 Strategies are toggled with `POLYMARKET_BOT_<NAME>_ENABLED`, not a flag.
+
+## Troubleshooting
+
+**`doctor` fails with `CERTIFICATE_VERIFY_FAILED` / hostname mismatch on a host
+that works everywhere else.** Something between you and Polymarket is
+terminating TLS with a certificate the system trust store does not know — a
+corporate proxy, a firewall, or a captive portal. This is a network problem, not
+a bot problem, and `doctor` names it as such. Fix it at the network layer:
+
+- Add the proxy's root CA to the system trust store, or
+- point the bot at the proxy's root CA with
+  `POLYMARKET_BOT_CA_BUNDLE=/path/to/proxy-ca.pem`.
+
+Do not disable certificate verification to work around this. The bot has no
+option to do so on purpose; without a valid certificate you cannot tell the
+exchange from an attacker, and this is the network that carries your orders.
 
 ## Configuration
 

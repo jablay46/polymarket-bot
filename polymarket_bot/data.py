@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import random
+import ssl
 import threading
 import time
 import urllib.error
@@ -60,16 +61,40 @@ class DataError(RuntimeError):
     """Raised when a market data request cannot be completed."""
 
 
+class TlsError(DataError):
+    """Raised when a request fails TLS verification.
+
+    Kept distinct from a generic :class:`DataError` because the cause is almost
+    never the bot: it is an intercepting proxy or a stale trust store on the
+    host, and the operator needs a specific hint rather than a five-line
+    ``urlopen`` traceback.
+    """
+
+
 # --------------------------------------------------------------------- HTTP
 
 
 class HttpClient:
     """Minimal JSON HTTP client with retries and jittered backoff."""
 
-    def __init__(self, timeout: float = 10.0, max_retries: int = 3, user_agent: str = "polymarket-bot/1.0"):
+    def __init__(
+        self,
+        timeout: float = 10.0,
+        max_retries: int = 3,
+        user_agent: str = "polymarket-bot/1.0",
+        ca_bundle: str = "",
+    ):
         self.timeout = timeout
         self.max_retries = max(1, max_retries)
         self.user_agent = user_agent
+        # Optional private CA bundle. Needed only when the network terminates
+        # TLS with a certificate no public trust store knows about (a corporate
+        # proxy), which shows up as CERTIFICATE_VERIFY_FAILED / hostname
+        # mismatch on hosts that are fine everywhere else.
+        self.ca_bundle = ca_bundle
+        self._ssl_context = None
+        if ca_bundle:
+            self._ssl_context = ssl.create_default_context(cafile=ca_bundle)
 
     def _request(self, url: str, data: bytes | None = None, method: str = "GET") -> object:
         last_error: Exception | None = None
@@ -80,7 +105,7 @@ class HttpClient:
             if data is not None:
                 req.add_header("Content-Type", "application/json")
             try:
-                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                with urllib.request.urlopen(req, timeout=self.timeout, context=self._ssl_context) as resp:
                     body = resp.read().decode("utf-8")
                 return json.loads(body) if body else None
             except urllib.error.HTTPError as exc:
@@ -88,11 +113,29 @@ class HttpClient:
                 if exc.code < 500 and exc.code != 429:
                     raise DataError(f"HTTP {exc.code} for {url}") from exc
                 last_error = exc
+            except ssl.SSLCertVerificationError as exc:
+                # Retrying will not make a bad certificate good, so fail now
+                # with a hint instead of burning the backoff budget.
+                raise TlsError(self._tls_hint(url, exc)) from exc
             except Exception as exc:  # noqa: BLE001 - network layer, retry everything
                 last_error = exc
             if attempt < self.max_retries - 1:
                 time.sleep((0.4 * 2**attempt) + random.random() * 0.2)
         raise DataError(f"request failed after {self.max_retries} attempts: {url}: {last_error}")
+
+    def _tls_hint(self, url: str, exc: Exception) -> str:
+        host = urllib.parse.urlparse(url).hostname or url
+        return (
+            f"TLS verification failed for {host}: {exc}. "
+            "This is almost always the network, not the bot: something between "
+            "this host and Polymarket is presenting a certificate that does not "
+            "match the hostname (a TLS-intercepting proxy or firewall), or the "
+            "system trust store is out of date. Fixes: install the proxy's root "
+            "CA into the system trust store, or point the bot at it with "
+            "POLYMARKET_BOT_CA_BUNDLE=/path/to/ca.pem. Do not disable "
+            "verification to work around this."
+        )
+
 
     def get(self, url: str, params: dict | None = None) -> object:
         if params:
@@ -291,7 +334,9 @@ class MarketScanner:
     def __post_init__(self) -> None:
         if self.http is None:
             self.http = HttpClient(
-                timeout=self.config.request_timeout, max_retries=self.config.max_retries
+                timeout=self.config.request_timeout,
+                max_retries=self.config.max_retries,
+                ca_bundle=self.config.ca_bundle,
             )
 
     # ---------------------------------------------------------- discovery
